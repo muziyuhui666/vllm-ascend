@@ -19,6 +19,7 @@ from dataclasses import replace
 from typing import Any, Protocol, TypeAlias, cast
 
 import torch
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
@@ -29,7 +30,9 @@ from vllm.models.qwen4_exp.amd import model as _upstream_model  # noqa: F401
 from vllm.models.qwen4_exp.amd import qsa as upstream_qsa
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
+    LayerNameType,
     canonicalize_singleton_dim_strides,
+    direct_register_custom_op,
     get_dtype_size,
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, AttentionImplBase, CommonAttentionMetadata
@@ -48,6 +51,12 @@ from vllm_ascend.ops.triton.qwen4_exp.qsa import (
 )
 from vllm_ascend.ops.triton.qwen4_exp.qsa import (
     qsa_store_cache_rows as qsa_store_cache_rows_fused,
+)
+from vllm_ascend.ops.triton.qwen4_exp.qsa import (
+    qsa_store_key_position_rows as qsa_store_key_position_rows_fused,
+)
+from vllm_ascend.ops.triton.qwen4_exp.qsa import (
+    qsa_store_kv_rows as qsa_store_kv_rows_fused,
 )
 from vllm_ascend.utils import npu_stream_switch, vllm_version_is
 
@@ -428,6 +437,67 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
                 return out, None
             return self._select(query[:num_tokens], compressed_metadata, out), None
 
+    def forward_projected(
+        self,
+        query: torch.Tensor,
+        token_k: torch.Tensor,
+        positions: torch.Tensor,
+        out: torch.Tensor | None = None,
+        *,
+        main_key: torch.Tensor | None = None,
+        main_value: torch.Tensor | None = None,
+        main_key_cache: torch.Tensor | None = None,
+        main_value_cache: torch.Tensor | None = None,
+        main_slot_mapping: torch.Tensor | None = None,
+        metadata: tuple[QSAIndexerMetadataProtocol, QSAIndexerMetadataProtocol] | None = None,
+    ) -> torch.Tensor:
+        """Continue the indexer after its projection has run on an auxiliary stream."""
+        if metadata is None:
+            metadata = self._metadata()
+        if metadata is None:
+            if self.skip_topk and out is not None:
+                return out
+            raise RuntimeError("Projected QSA indexer inputs require metadata")
+
+        raw_metadata, compressed_metadata = metadata
+        num_tokens = raw_metadata.num_actual_tokens
+        positions = positions[..., :num_tokens]
+        self._update_and_compress(
+            token_k,
+            positions,
+            raw_metadata,
+            compressed_metadata,
+        )
+
+        if self.skip_topk:
+            if out is None:
+                raise RuntimeError("QSA top-k reuse requires an output buffer")
+            if all(
+                tensor is not None
+                for tensor in (main_key, main_value, main_key_cache, main_value_cache, main_slot_mapping)
+            ):
+                assert main_key is not None and main_value is not None
+                assert main_key_cache is not None and main_value_cache is not None
+                assert main_slot_mapping is not None
+                qsa_store_kv_rows_fused(
+                    main_key_cache,
+                    main_value_cache,
+                    main_slot_mapping,
+                    main_key[:num_tokens],
+                    main_value[:num_tokens],
+                )
+            return out
+        return self._select(
+            query[:num_tokens],
+            compressed_metadata,
+            out,
+            main_key=main_key,
+            main_value=main_value,
+            main_key_cache=main_key_cache,
+            main_value_cache=main_value_cache,
+            main_slot_mapping=main_slot_mapping,
+        )
+
     def project_qk(
         self,
         hidden_states: torch.Tensor,
@@ -510,13 +580,17 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
                 compressed_metadata.slot_mapping,
                 normalized,
             )
-        # Keep ring writes after the fused launch: other rows can still read
-        # the previous ring contents while producing compressed groups.
-        _store_qsa_cache_rows(raw_key_cache, raw_metadata.slot_mapping, token_k[:num_tokens])
-        if rope_position_cache is not None:
-            _store_qsa_cache_rows(
+        # Keep ring writes after compression: other rows can still read the
+        # previous ring contents while producing compressed groups. Fuse the
+        # raw key and position writes when a position cache is present.
+        if rope_position_cache is None:
+            _store_qsa_cache_rows(raw_key_cache, raw_metadata.slot_mapping, token_k[:num_tokens])
+        else:
+            qsa_store_key_position_rows_fused(
+                raw_key_cache,
                 rope_position_cache,
                 raw_metadata.slot_mapping,
+                token_k[:num_tokens],
                 position_rows,
             )
 
@@ -525,6 +599,12 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
         query: torch.Tensor,
         metadata: Any,
         out: torch.Tensor | None,
+        *,
+        main_key: torch.Tensor | None = None,
+        main_value: torch.Tensor | None = None,
+        main_key_cache: torch.Tensor | None = None,
+        main_value_cache: torch.Tensor | None = None,
+        main_slot_mapping: torch.Tensor | None = None,
     ) -> torch.Tensor:
         logger.info_once(
             "QSA is using native request-batched CANN LightningIndexerV2 (page_size=%d).",
@@ -547,6 +627,16 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
             out,
             num_actual_requests=getattr(metadata, "qsa_num_live_requests", None),
             num_actual_tokens=getattr(metadata, "qsa_num_live_tokens", metadata.num_actual_tokens),
+            prepared_metadata=getattr(metadata, "qsa_lightning_v2_metadata", None),
+            out_initialized=out is not None,
+            prepared_compressed_lengths=getattr(metadata, "qsa_compressed_lengths", None),
+            prepared_residual_lengths=getattr(metadata, "qsa_residual_lengths", None),
+            prepared_score_weights=getattr(metadata, "qsa_score_weights", None),
+            main_key=main_key,
+            main_value=main_value,
+            main_key_cache=main_key_cache,
+            main_value_cache=main_value_cache,
+            main_slot_mapping=main_slot_mapping,
         )
 
 
@@ -1025,10 +1115,18 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Reuse upstream's registered opaque QSA transaction. The Ascend
-        # subclass still supplies its platform backend and overridden
-        # preparation/cache methods, while avoiding an unregistered wrapper.
-        return super().forward(positions, hidden_states)
+        if not current_platform.opaque_attention_op():
+            return self._forward_impl(positions, hidden_states)
+        num_tokens = hidden_states.shape[0]
+        attn_output = hidden_states.new_empty(num_tokens, self.num_heads, self.head_dim)
+        torch.ops.vllm.qwen4_exp_ascend_qsa_core_with_output(
+            hidden_states,
+            positions,
+            attn_output,
+            upstream_qsa._encode_layer_name(self.layer_name),
+        )
+        output, _ = self.o_proj(attn_output.view(num_tokens, -1))
+        return output
 
     def _forward_impl(
         self,
@@ -1251,6 +1349,8 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
         output: torch.Tensor,
         qkv: torch.Tensor | None = None,
         gate: torch.Tensor | None = None,
+        index_query: torch.Tensor | None = None,
+        index_token_k: torch.Tensor | None = None,
     ) -> None:
         metadata = get_forward_context().attn_metadata
         if isinstance(metadata, list):
@@ -1284,7 +1384,47 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
                 raise RuntimeError("Fused QSA preparation requires an output gate")
             gate.copy_(projected_gate.view_as(gate))
 
-        if vllm_version_is("0.33.0"):
+        if (index_query is None) != (index_token_k is None):
+            raise RuntimeError("QSA indexer projection outputs must be provided together")
+        if index_query is not None:
+            torch.npu.current_stream().wait_stream(_qsa_indexer_stream())
+
+        pcp_context = getattr(side_metadata, "pcp_context", None)
+        write_key, write_value = key, value
+        if pcp_context is not None and key is not None and value is not None:
+            write_key, write_value = pcp_context.gather_tokens(torch.stack((key, value), dim=1)).unbind(dim=1)
+
+        main_key_cache, main_value_cache = self.kv_cache
+        main_key_cache = canonicalize_singleton_dim_strides(main_key_cache)
+        main_value_cache = canonicalize_singleton_dim_strides(main_value_cache)
+        can_fuse_main_store = bool(
+            pcp_context is None
+            and key is not None
+            and value is not None
+            and key.shape[1] == 1
+            and value.shape[1] == 1
+            and main_key_cache.ndim == 4
+            and main_value_cache.shape == main_key_cache.shape
+            and main_key_cache.shape[2] == 1
+        )
+        indexer_kwargs = {
+            "main_key": key if can_fuse_main_store else None,
+            "main_value": value if can_fuse_main_store else None,
+            "main_key_cache": main_key_cache if can_fuse_main_store else None,
+            "main_value_cache": main_value_cache if can_fuse_main_store else None,
+            "main_slot_mapping": main_metadata.slot_mapping if can_fuse_main_store else None,
+        }
+        main_store_fused = False
+        if index_query is not None and index_token_k is not None:
+            selected = self.indexer.forward_projected(
+                index_query,
+                index_token_k,
+                positions,
+                self.topk_indices_buffer[:num_tokens],
+                **indexer_kwargs,
+            )
+            main_store_fused = can_fuse_main_store
+        elif vllm_version_is("0.33.0"):
             selected = cast(
                 torch.Tensor,
                 self.indexer(  # type: ignore[call-arg]
@@ -1306,17 +1446,15 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         if query is None or key is None or value is None:
             raise RuntimeError("QSA preparation did not produce Q/K/V tensors")
-        pcp_context = getattr(side_metadata, "pcp_context", None)
-        write_key, write_value = key, value
-        if pcp_context is not None:
-            write_key, write_value = pcp_context.gather_tokens(torch.stack((key, value), dim=1)).unbind(dim=1)
-        self.impl.do_kv_cache_update(
-            self,
-            write_key,
-            write_value,
-            self.kv_cache,
-            main_metadata.slot_mapping,
-        )
+        if not main_store_fused:
+            assert write_key is not None and write_value is not None
+            self.impl.do_kv_cache_update(
+                self,
+                write_key,
+                write_value,
+                self.kv_cache,
+                main_metadata.slot_mapping,
+            )
         # `impl` is the class patched onto the upstream module, so its method
         # name and signature follow the tree's upstream ABI.
         impl: Any = self.impl
@@ -1350,6 +1488,103 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
                     value=value,
                 )
         maybe_save_kv_layer_to_connector(self.layer_name, list(self.kv_cache))
+
+
+def _ascend_qsa_layer(
+    layer_name: LayerNameType,
+) -> AscendQwen4ExpQSAAttention:
+    resolved = upstream_qsa._resolve_layer_name(layer_name)
+    layer = get_forward_context().no_compile_layers[resolved]
+    if not isinstance(layer, AscendQwen4ExpQSAAttention):
+        raise TypeError(f"{resolved} is not an Ascend Qwen4Exp QSA owner")
+    return layer
+
+
+@eager_break_during_capture
+def qwen4_exp_ascend_qsa_core_with_output(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    """Execute the QSA core eagerly so its auxiliary stream survives replay."""
+    layer = _ascend_qsa_layer(layer_name)
+    layer._forward_core_with_output(positions, hidden_states, output)
+
+
+def qwen4_exp_ascend_qsa_core_with_output_fake(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    return None
+
+
+def qwen4_exp_ascend_qsa_prepare_with_output(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    qkv: torch.Tensor,
+    index_query: torch.Tensor,
+    index_token_k: torch.Tensor,
+    output: torch.Tensor,
+    gate: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    _ascend_qsa_layer(layer_name)._run_qsa(
+        hidden_states,
+        positions,
+        None,
+        None,
+        None,
+        output,
+        qkv=qkv,
+        gate=gate,
+        index_query=index_query,
+        index_token_k=index_token_k,
+    )
+
+
+def qwen4_exp_ascend_qsa_with_output(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    index_query: torch.Tensor,
+    index_token_k: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    _ascend_qsa_layer(layer_name)._run_qsa(
+        hidden_states,
+        positions,
+        query,
+        key,
+        value,
+        output,
+        index_query=index_query,
+        index_token_k=index_token_k,
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ascend_qsa_core_with_output",
+    op_func=qwen4_exp_ascend_qsa_core_with_output,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_ascend_qsa_core_with_output_fake,
+    dispatch_key="PrivateUse1",
+)
+direct_register_custom_op(
+    op_name="qwen4_exp_ascend_qsa_prepare_with_output",
+    op_func=qwen4_exp_ascend_qsa_prepare_with_output,
+    mutates_args=["output", "gate"],
+)
+direct_register_custom_op(
+    op_name="qwen4_exp_ascend_qsa_with_output",
+    op_func=qwen4_exp_ascend_qsa_with_output,
+    mutates_args=["output"],
+)
 
 
 __all__ = ["AscendQSAIndexer", "AscendQwen4ExpQSAAttention"]

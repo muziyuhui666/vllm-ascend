@@ -140,3 +140,33 @@ def test_qsa_uses_fused_sparse_backends_and_upstream_qkv_projection() -> None:
         "VLLM_ASCEND_ENABLE_QSA_MAIN_FUSED_NORM_ROPE",
     ):
         assert fallback not in qsa
+
+
+def test_qsa_main_abi_keeps_ascend_fusion_wiring() -> None:
+    qsa = _source("vllm_ascend/models/qwen4_exp/qsa.py")
+    lightning = _source("vllm_ascend/models/qwen4_exp/lightning_indexer.py")
+
+    for fused_entry in (
+        "qwen4_exp_ascend_qsa_core_with_output",
+        "qwen4_exp_ascend_qsa_prepare_with_output",
+        "qwen4_exp_ascend_qsa_with_output",
+        "qwen4_exp_ascend_qsa_sigmoid_mul_",
+        "qsa_store_key_position_rows_fused",
+        "qsa_store_kv_rows_fused",
+    ):
+        assert fused_entry in qsa
+    for prepared_input in (
+        "qsa_lightning_v2_metadata",
+        "qsa_compressed_lengths",
+        "qsa_residual_lengths",
+        "qsa_score_weights",
+    ):
+        assert prepared_input in qsa
+    for fused_store_arg in (
+        "key=main_key",
+        "value=main_value",
+        "key_cache=main_key_cache",
+        "value_cache=main_value_cache",
+        "slot_mapping=main_slot_mapping",
+    ):
+        assert fused_store_arg in lightning
