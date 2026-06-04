@@ -523,7 +523,10 @@ class AscendModelSlimConfig(QuantizationConfig):
                     prefix = ".".join(parts)
 
         # TODO: remove it when vllm fixes the WeightsMapper bug of qwen3-vl.
-        if model_type in ["qwen3_vl"] and prefix == "lm_head":
+        # For some MTP drafter models, the lm_head layer is initialized with
+        # prefix="lm_head", while the quant description key is mapped to
+        # "language_model.lm_head.weight".
+        if model_type in ["qwen3_vl", "qwen3_5", "qwen3_5_moe"] and prefix == "lm_head":
             prefix = "language_model.lm_head"
         if model_type in ["bailing_hybrid"]:
             # Adapt to bailing_hybrid architecture: update layer names to MoE convention
