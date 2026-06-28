@@ -1077,6 +1077,23 @@ class MiniMaxM3VLDummyInputsBuilder(
 class MiniMaxM3VLMultiModalProcessor(
     BaseMultiModalProcessor[MiniMaxM3VLProcessingInfo]
 ):
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        # MiniMax-M3's processor default sets videos_kwargs.do_resize=False,
+        # which assumes pre-resized frames. vLLM passes raw video frames, so
+        # resize by default unless the user explicitly overrides it.
+        merged_kwargs = dict(do_resize=True, **mm_kwargs, **tok_kwargs)
+        return self.info.ctx.call_hf_processor(
+            self.info.get_hf_processor(**mm_kwargs),
+            dict(text=prompt, **mm_data),
+            merged_kwargs,
+        )
+
     def _get_prompt_updates(
         self,
         mm_items: MultiModalDataItems,
