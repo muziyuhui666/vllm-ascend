@@ -21,6 +21,10 @@ import os
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
     MRotaryEmbedding,
@@ -57,6 +61,41 @@ _cos: torch.Tensor = None
 _sin: torch.Tensor = None
 _cos_slice: torch.Tensor = None
 _sin_slice: torch.Tensor = None
+
+
+def _maybe_select_local_positions(
+    positions: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Align RoPE positions with FlashComm1 sequence-parallel token shards."""
+    try:
+        flash_comm_v1_enabled = bool(_EXTRA_CTX.flash_comm_v1_enabled)
+        pad_size = int(_EXTRA_CTX.pad_size or 0)
+    except AssertionError:
+        return positions
+
+    if not flash_comm_v1_enabled:
+        return positions
+
+    seq_dim = 1 if positions.ndim > 1 else 0
+    position_tokens = positions.shape[seq_dim]
+    if position_tokens == num_tokens:
+        return positions
+
+    tp_size = get_tensor_model_parallel_world_size()
+    padded_tokens = num_tokens * tp_size
+    if tp_size > 1 and position_tokens + pad_size == padded_tokens:
+        if pad_size > 0:
+            pad_shape = list(positions.shape)
+            pad_shape[seq_dim] = pad_size
+            positions = torch.cat(
+                (positions, positions.new_zeros(pad_shape)),
+                dim=seq_dim,
+            )
+        tp_rank = get_tensor_model_parallel_rank()
+        return positions.chunk(tp_size, dim=seq_dim)[tp_rank].contiguous()
+
+    return positions
 
 
 def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype, device):
@@ -165,6 +204,7 @@ def rope_forward_oot(
         raise NotImplementedError("Batched rotary embedding is currently not supported on NPU.")
     if HAS_TRITON:
         num_tokens = query.shape[0]
+        positions = _maybe_select_local_positions(positions, num_tokens)
         query, key = rope_forward_triton(
             query.view(num_tokens, -1, head_size),
             key.view(num_tokens, -1, head_size),

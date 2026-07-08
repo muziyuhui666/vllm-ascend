@@ -20,6 +20,37 @@ from vllm.triton_utils import tl, triton
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 
+def _get_rope_debug_context() -> str:
+    try:
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        tp_info = (
+            f"tp_rank={get_tensor_model_parallel_rank()}, "
+            f"tp_size={get_tensor_model_parallel_world_size()}"
+        )
+    except Exception as exc:
+        tp_info = f"tp_info_error={type(exc).__name__}: {exc}"
+
+    try:
+        from vllm.forward_context import get_forward_context
+
+        ctx = get_forward_context()
+        ctx_info = (
+            f"ctx_num_tokens={getattr(ctx, 'num_tokens', None)}, "
+            f"ctx_flash_comm_v1_enabled={getattr(ctx, 'flash_comm_v1_enabled', None)}, "
+            f"ctx_pad_size={getattr(ctx, 'pad_size', None)}, "
+            f"ctx_in_profile_run={getattr(ctx, 'in_profile_run', None)}, "
+            f"ctx_moe_comm_type={getattr(ctx, 'moe_comm_type', None)}"
+        )
+    except Exception as exc:
+        ctx_info = f"ctx_info_error={type(exc).__name__}: {exc}"
+
+    return f"{tp_info}, {ctx_info}"
+
+
 @triton.jit
 def _triton_rope(
     q_ptr,
@@ -279,8 +310,27 @@ def rope_forward_triton(
     n_row = min(num_tokens, num_vectorcore)
 
     if cos_sin_cache is not None and positions is not None:
-        assert positions.shape[0] == num_tokens
-        assert rope_dim <= head_dim
+        if positions.shape[0] != num_tokens:
+            raise AssertionError(
+                "rope_forward_triton positions token mismatch: "
+                f"positions_shape={tuple(positions.shape)}, "
+                f"q_shape={tuple(q.shape)}, "
+                f"k_shape={tuple(k.shape)}, "
+                f"num_tokens_from_q={num_tokens}, "
+                f"cos_sin_cache_shape={tuple(cos_sin_cache.shape)}, "
+                f"rope_dim={rope_dim}, "
+                f"head_dim={head_dim}, "
+                f"is_neox_style={is_neox_style}, "
+                f"{_get_rope_debug_context()}"
+            )
+        if rope_dim > head_dim:
+            raise AssertionError(
+                "rope_forward_triton rope_dim exceeds head_dim: "
+                f"rope_dim={rope_dim}, head_dim={head_dim}, "
+                f"positions_shape={tuple(positions.shape)}, "
+                f"q_shape={tuple(q.shape)}, k_shape={tuple(k.shape)}, "
+                f"{_get_rope_debug_context()}"
+            )
         pad_rope_dim = triton.next_power_of_2(rope_dim)
         _triton_rope[(n_row,)](
             q,
