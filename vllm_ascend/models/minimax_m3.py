@@ -38,6 +38,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import set_forward_context
 from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -1409,17 +1410,18 @@ class MiniMaxM3SparseForConditionalGeneration(
             image_embeds = image_input["image_embeds"].type(self.vision_tower.dtype)
         else:
             pixel_values = image_input["pixel_values"].type(self.vision_tower.dtype)
-            if self.use_data_parallel:
-                return run_dp_sharded_mrope_vision_model(
-                    self.vision_tower,
-                    pixel_values,
-                    grid_thw_list,
-                    rope_type="rope_3d",
+            with set_forward_context(None, self.vllm_config):
+                if self.use_data_parallel:
+                    return run_dp_sharded_mrope_vision_model(
+                        self.vision_tower,
+                        pixel_values,
+                        grid_thw_list,
+                        rope_type="rope_3d",
+                    )
+                image_embeds = self.vision_tower(
+                    pixel_values=pixel_values,
+                    grid_thw=grid_thw_list,
                 )
-            image_embeds = self.vision_tower(
-                pixel_values=pixel_values,
-                grid_thw=grid_thw_list,
-            )
 
         merge_size = self.vision_tower.spatial_merge_size
         sizes = (grid_thw.prod(-1) // (merge_size * merge_size)).tolist()
@@ -1436,17 +1438,18 @@ class MiniMaxM3SparseForConditionalGeneration(
             pixel_values = video_input["pixel_values_videos"].type(
                 self.vision_tower.dtype
             )
-            if self.use_data_parallel:
-                return run_dp_sharded_mrope_vision_model(
-                    self.vision_tower,
-                    pixel_values,
-                    grid_thw_list,
-                    rope_type="rope_3d",
+            with set_forward_context(None, self.vllm_config):
+                if self.use_data_parallel:
+                    return run_dp_sharded_mrope_vision_model(
+                        self.vision_tower,
+                        pixel_values,
+                        grid_thw_list,
+                        rope_type="rope_3d",
+                    )
+                video_embeds = self.vision_tower(
+                    pixel_values=pixel_values,
+                    grid_thw=grid_thw_list,
                 )
-            video_embeds = self.vision_tower(
-                pixel_values=pixel_values,
-                grid_thw=grid_thw_list,
-            )
 
         merge_size = self.vision_tower.spatial_merge_size
         sizes = (grid_thw.prod(-1) // (merge_size * merge_size)).tolist()
