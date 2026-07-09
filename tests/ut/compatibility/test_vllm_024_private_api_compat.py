@@ -123,3 +123,61 @@ def test_rejection_sampler_helper_resolution_supports_new_main_names():
         main_block_stats,
         insert_resampled,
     )
+
+
+def _load_dflash_patch(monkeypatch, causal_lm_cls):
+    torch_module = ModuleType("torch")
+    torch_module.__path__ = []
+    torch_module.Tensor = object
+
+    torch_nn_module = ModuleType("torch.nn")
+    torch_nn_module.__path__ = []
+    torch_functional_module = ModuleType("torch.nn.functional")
+    torch_nn_module.functional = torch_functional_module
+    torch_module.nn = torch_nn_module
+
+    qwen_module_name = "vllm.model_executor.models.qwen3_dflash"
+    qwen_module = ModuleType(qwen_module_name)
+
+    class DFlashModel:
+        pass
+
+    qwen_module.DFlashQwen3ForCausalLM = causal_lm_cls
+    qwen_module.DFlashQwen3Model = DFlashModel
+
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
+    monkeypatch.setitem(sys.modules, "torch.nn", torch_nn_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch.nn.functional",
+        torch_functional_module,
+    )
+    monkeypatch.setitem(sys.modules, qwen_module_name, qwen_module)
+
+    patch_path = (
+        REPO_ROOT
+        / "vllm_ascend"
+        / "patch"
+        / "worker"
+        / "patch_qwen3_dflash.py"
+    )
+    _load_module_from_path("test_qwen3_dflash_patch", patch_path)
+
+
+def test_dflash_patch_is_noop_without_optional_mask_embedding_method(monkeypatch):
+    class DFlashWithoutMaskEmbedding:
+        pass
+
+    _load_dflash_patch(monkeypatch, DFlashWithoutMaskEmbedding)
+
+    assert not hasattr(DFlashWithoutMaskEmbedding, "_read_mask_embedding")
+
+
+def test_dflash_patch_wraps_optional_mask_embedding_method(monkeypatch):
+    class DFlashWithMaskEmbedding:
+        def _read_mask_embedding(self):
+            raise RuntimeError("optional mask embedding is unavailable")
+
+    _load_dflash_patch(monkeypatch, DFlashWithMaskEmbedding)
+
+    assert DFlashWithMaskEmbedding()._read_mask_embedding() is None
