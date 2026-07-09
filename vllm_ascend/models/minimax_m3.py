@@ -97,9 +97,9 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
+from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 
 from vllm_ascend.attention.msa_m3 import MiniMaxM3SparseAttention
-from vllm_ascend.models.minimax_m3_vit import MiniMaxVLVisionModel
 
 
 logger = init_logger(__name__)

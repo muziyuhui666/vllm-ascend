@@ -9,10 +9,14 @@ from unittest.mock import patch
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+from vllm.models.minimax_m3.common.vision_tower import (
+    MiniMaxVLVisionModel as VllmMiniMaxVLVisionModel,
+)
 
 from vllm_ascend.models.minimax_m3 import (
     MiniMaxM3Attention,
     MiniMaxM3MoE,
+    MiniMaxVLVisionModel,
     _get_rope_parameters,
     _sparse_attention_layer_ids,
 )
@@ -81,6 +85,9 @@ def _make_attention() -> MiniMaxM3Attention:
 
 
 class TestMiniMaxM3Modeling(unittest.TestCase):
+
+    def test_vision_tower_uses_vllm_common_implementation(self) -> None:
+        self.assertIs(MiniMaxVLVisionModel, VllmMiniMaxVLVisionModel)
 
     def test_moe_passes_swigluoai_config_during_construction(self) -> None:
         config = PretrainedConfig(
