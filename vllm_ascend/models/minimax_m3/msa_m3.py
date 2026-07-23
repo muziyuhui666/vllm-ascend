@@ -47,7 +47,6 @@ from vllm_ascend.models.minimax_m3.ops.msa_m3_triton import (
 )
 from vllm_ascend.ops.linear import AscendColumnParallelLinear
 from vllm_ascend.ops.linear_op import get_parallel_op
-from vllm_ascend.utils import enable_sfa_dcp_replicated_indexer
 
 
 def _active_decode_num_reqs(
@@ -160,21 +159,11 @@ class AscendMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        sfa_dcp_replicated_indexer_size = 1
-        if enable_sfa_dcp_replicated_indexer():
-            parallel_config = getattr(vllm_config, "parallel_config", None)
-            sfa_dcp_replicated_indexer_size = getattr(
-                parallel_config,
-                "decode_context_parallel_size",
-                1,
-            )
         return AscendSFAIndexerCacheSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            cache_dtype_str=getattr(vllm_config.cache_config, "cache_dtype", None),
-            sfa_dcp_replicated_indexer_size=sfa_dcp_replicated_indexer_size,
         )
 
     def forward(self) -> None: ...
