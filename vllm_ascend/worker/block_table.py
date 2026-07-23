@@ -1,3 +1,5 @@
+from inspect import signature
+
 import numpy as np
 import torch
 from vllm.distributed import get_dcp_group, get_pcp_group
@@ -8,7 +10,18 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
-from vllm_ascend.utils import vllm_version_is
+
+
+def _slot_mapping_kernel_uses_split_kv_blocks() -> bool:
+    arg_names = getattr(_compute_slot_mapping_kernel, "arg_names", None)
+    if arg_names is not None:
+        return "KV_CACHE_BLOCK_SIZE" in arg_names
+
+    fn = getattr(_compute_slot_mapping_kernel, "fn", None)
+    if fn is not None:
+        return "KV_CACHE_BLOCK_SIZE" in signature(fn).parameters
+
+    return False
 
 
 class BlockTable:
@@ -167,10 +180,10 @@ class BlockTable:
                 "PAD_ID": PAD_SLOT_ID,
                 "BLOCK_SIZE": 1024,
             }
-            if not vllm_version_is("0.25.1"):
+            if _slot_mapping_kernel_uses_split_kv_blocks():
                 # vLLM #40996 split physical KV blocks into kernel blocks in
                 # the slot-mapping kernel. These are required constexprs on
-                # main; the v0.25.1 kernel does not accept them.
+                # some vLLM versions, but not all 0.25.x kernels accept them.
                 kernel_kwargs.update(
                     KV_CACHE_BLOCK_SIZE=self.physical_block_size,
                     BLOCKS_PER_KV_BLOCK=self.blocks_per_phys_block,
