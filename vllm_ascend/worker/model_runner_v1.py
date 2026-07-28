@@ -4437,12 +4437,13 @@ class NPUModelRunner(GPUModelRunner):
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
-                if isinstance(layer_kv_cache_spec, AscendSFAIndexerCacheSpec):
+                # Prefer the backend declared by the layer itself. Some
+                # indexer-cache layers require their own metadata builder.
+                attn_backend = layers[layer_name].get_attn_backend()
+                if attn_backend is None and isinstance(layer_kv_cache_spec, AscendSFAIndexerCacheSpec):
                     from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 
                     attn_backend = AscendSFAIndexerBackend
-                else:
-                    attn_backend = layers[layer_name].get_attn_backend()
                 full_cls_name = attn_backend.full_cls_name()
                 key = (full_cls_name, layer_kv_cache_spec)
                 attn_backends[key] = AttentionGroupKey(attn_backend, layer_kv_cache_spec)
@@ -4610,6 +4611,11 @@ class NPUModelRunner(GPUModelRunner):
                         dtype=spec.dtype,
                         cache_dtype_str=spec.cache_dtype_str,
                     )
+                    attn_layer_names.add(layer_name)
+
+            elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                kv_cache_spec[layer_name] = spec
+                if isinstance(spec, AttentionSpec):
                     attn_layer_names.add(layer_name)
 
         if len(mamba_layers) > 0:
