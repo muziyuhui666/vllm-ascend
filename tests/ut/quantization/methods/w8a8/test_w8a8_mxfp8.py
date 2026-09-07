@@ -229,21 +229,20 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
         self.assertTrue(hasattr(layer, "_mxfp8_original_shapes"))
         self.assertIn("w13_weight", layer._mxfp8_original_shapes)
         self.assertEqual(layer.w13_weight.shape, (original_shape[0], original_shape[2], original_shape[1]))
-        self.assertFalse(layer.w13_weight.data.is_contiguous())
-        self.assertFalse(layer.w2_weight.data.is_contiguous())
-        self.assertFalse(layer.w13_weight_scale.data.is_contiguous())
-        self.assertFalse(layer.w2_weight_scale.data.is_contiguous())
-
-        weight_views = self.scheme.get_eplb_weight_views(layer)
-        self.assertTrue(self.scheme.supports_eplb)
-        self.assertEqual(len(weight_views), 4)
-        for source, weight_view in zip(
-            [layer.w13_weight, layer.w2_weight, layer.w13_weight_scale, layer.w2_weight_scale],
-            weight_views,
+        for parameter in (
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
         ):
-            self.assertTrue(weight_view.is_contiguous())
-            self.assertEqual(weight_view.shape[0], self.num_experts)
-            self.assertEqual(weight_view.untyped_storage().data_ptr(), source.untyped_storage().data_ptr())
+            self.assertTrue(parameter.data.is_contiguous())
+        for param_name, buffer_name in (
+            ("w13_weight", "_mxfp8_w13_weight_buf"),
+            ("w2_weight", "_mxfp8_w2_weight_buf"),
+            ("w13_weight_scale", "_mxfp8_w13_scale_buf"),
+            ("w2_weight_scale", "_mxfp8_w2_scale_buf"),
+        ):
+            self.assertEqual(getattr(layer, param_name).data_ptr(), getattr(layer, buffer_name).data_ptr())
 
     @patch("vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8.get_current_vllm_config")
     @patch("vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8.use_cann_megamoe", return_value=False)
