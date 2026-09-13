@@ -275,6 +275,26 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # The runner must recompute router_logits via the gate.
         return self.gate is not None
 
+    @staticmethod
+    def _compute_router_logits(
+        gate: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run gates in FP32 only when the model explicitly requests it."""
+        if hasattr(gate, "weight_fp32"):
+            gate_input = (
+                router_logits
+                if router_logits.dtype == torch.float32
+                else hidden_states.float()
+            )
+            return F.linear(gate_input, gate.weight_fp32)
+
+        # Unquantized gates such as Qwen3.5 are stored in BF16. Calling the
+        # layer preserves its configured compute dtype and weight layout.
+        gate_output = gate(hidden_states)
+        return gate_output[0] if isinstance(gate_output, tuple) else gate_output
+
     @property
     def use_dp_chunking(self) -> bool:
         """Ascend uses its own forward_impl path, not the FlashInfer Cutlass
@@ -453,12 +473,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 if self.is_internal_router:
                     gate = self.gate
                     assert gate is not None
-                    hidden_states_fp32 = (
-                        router_logits if router_logits.dtype == torch.float32 else hidden_states.float()
-                    )
-                    router_logits = F.linear(
-                        hidden_states_fp32,
-                        gate.weight_fp32 if hasattr(gate, "weight_fp32") else gate.weight.to(torch.float32),
+                    router_logits = self._compute_router_logits(
+                        gate, hidden_states, router_logits
                     )
                 return self.routed_experts.forward_impl(
                     hidden_states=hidden_states,
@@ -475,17 +491,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             if self.is_internal_router:
                 gate = self.gate
                 assert gate is not None
-                # Reuse the fused RMSNorm FP32 output when supplied. Otherwise,
-                # retain the standalone cast for other model call sites.
-                hidden_states_fp32 = (
-                    router_logits if router_logits.dtype == torch.float32 else shared_hidden_states.float()
-                )
                 before_routed_experts = torch.npu.current_stream().record_event()
-                # main (cdc4824a21): is_internal_router only checks self.gate,
-                # weight_fp32 may be absent, fall back to gate.weight.
-                router_logits = F.linear(
-                    hidden_states_fp32,
-                    gate.weight_fp32 if hasattr(gate, "weight_fp32") else gate.weight.to(torch.float32),
+                router_logits = self._compute_router_logits(
+                    gate, shared_hidden_states, router_logits
                 )
                 after_routed_experts = torch.npu.current_stream().record_event()
             else:

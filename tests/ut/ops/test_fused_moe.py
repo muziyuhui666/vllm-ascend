@@ -1710,6 +1710,40 @@ def test_set_lora_context_updates_experts(has_shared_experts):
         shared_experts.set_lora_context.assert_called_once_with(lora_context)
 
 
+def test_compute_router_logits_preserves_unquantized_gate_dtype(monkeypatch):
+    hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
+    incoming_router_logits = hidden_states
+    expected = torch.randn(2, 3, dtype=torch.bfloat16)
+    gate = MagicMock(return_value=(expected, None))
+    linear = MagicMock()
+    monkeypatch.setattr(fused_moe_module.F, "linear", linear)
+
+    result = AscendMoERunner._compute_router_logits(
+        gate, hidden_states, incoming_router_logits
+    )
+
+    assert result is expected
+    gate.assert_called_once_with(hidden_states)
+    linear.assert_not_called()
+
+
+def test_compute_router_logits_uses_precast_fp32_weight(monkeypatch):
+    hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
+    fused_rmsnorm_output = hidden_states.float()
+    weight_fp32 = torch.randn(3, 4)
+    expected = torch.randn(2, 3)
+    gate = SimpleNamespace(weight_fp32=weight_fp32)
+    linear = MagicMock(return_value=expected)
+    monkeypatch.setattr(fused_moe_module.F, "linear", linear)
+
+    result = AscendMoERunner._compute_router_logits(
+        gate, hidden_states, fused_rmsnorm_output
+    )
+
+    assert result is expected
+    linear.assert_called_once_with(fused_rmsnorm_output, weight_fp32)
+
+
 @pytest.mark.parametrize("has_shared_experts", [False, True])
 def test_forward_impl_returns_current_runner_contract(monkeypatch, has_shared_experts):
     runner = AscendMoERunner.__new__(AscendMoERunner)
