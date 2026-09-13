@@ -2470,6 +2470,7 @@ class MooncakeConnectorWorker:
     def _get_registered_kv_tensor_buffers(self, kv_caches: dict[str, torch.Tensor]) -> tuple[list[int], list[int]]:
         ptrs: list[int] = []
         lengths: list[int] = []
+        shared_regions_by_base: OrderedDict[int, int] = OrderedDict()
         private_layer_tensors: list[torch.Tensor] = []
 
         for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
@@ -2500,8 +2501,15 @@ class MooncakeConnectorWorker:
                 continue
             if base_addr % KV_CACHE_BUFFER_ALIGNMENT != 0:
                 raise RuntimeError(f"Tensor start addr {base_addr} is not aligned to 2 MiB.")
-            ptrs.append(base_addr)
-            lengths.append(kv_cache_tensor.size)
+            # Standardized multi-group descriptors can all describe views into
+            # the same backing allocation. Mooncake rejects overlapping memory
+            # registrations, so register that backing only once.
+            shared_regions_by_base[base_addr] = max(
+                shared_regions_by_base.get(base_addr, 0), kv_cache_tensor.size
+            )
+
+        ptrs.extend(shared_regions_by_base)
+        lengths.extend(shared_regions_by_base.values())
 
         if private_layer_tensors:
             regions_by_storage: OrderedDict[int, tuple[int, int]] = OrderedDict()

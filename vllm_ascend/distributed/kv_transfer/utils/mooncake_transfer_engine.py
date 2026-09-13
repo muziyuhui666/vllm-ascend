@@ -33,10 +33,14 @@ class GlobalTE:
             assert self.transfer_engine is not None, "Transfer engine must be initialized"
             if self.is_register_buffer:
                 return
-            for ptr, size in zip(ptrs, sizes):
+            for region_idx, (ptr, size) in enumerate(zip(ptrs, sizes)):
                 ret_value = self.transfer_engine.register_memory(ptr, size)
                 if ret_value != 0:
-                    raise RuntimeError("Mooncake memory registration failed.")
+                    raise RuntimeError(
+                        "Mooncake memory registration failed: "
+                        f"region_idx={region_idx}, ptr={hex(ptr)}, "
+                        f"size={size}, ret_value={ret_value}."
+                    )
             self.is_register_buffer = True
 
 
