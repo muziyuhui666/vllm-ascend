@@ -76,8 +76,9 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor) -> torch.Tensor:
     """EP communication only: pad according to the DP token distribution, then EP reduce_scatter."""
     forward_context = get_forward_context()
 
-    if _EXTRA_CTX.is_draft_model and is_vl_model():
-        return tensor_model_parallel_all_reduce(x)
+    # ljf
+    # if _EXTRA_CTX.is_draft_model and is_vl_model():
+    #     return tensor_model_parallel_all_reduce(x)
 
     dp_metadata = forward_context.dp_metadata
     if dp_metadata is None:
