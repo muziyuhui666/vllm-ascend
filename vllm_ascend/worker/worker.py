@@ -96,7 +96,10 @@ from vllm_ascend.utils import (
     setup_ascend_local_comm_res,
     vllm_version_is,
 )
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import (
+    NPUModelRunner,
+    supports_shared_kv_backing_with_transfer,
+)
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -702,7 +705,7 @@ class NPUWorker(WorkerBase):
             and has_mamba
             and layout.is_layer_compact
             and layout.is_block_compact
-            and self.vllm_config.kv_transfer_config is None
+            and supports_shared_kv_backing_with_transfer(self.vllm_config)
             and getattr(model_runner, "supports_standardized_shared_kv_backing", False)
             and not getattr(model_runner, "use_sparse", False)
             and not getattr(model_runner, "use_compress", False)

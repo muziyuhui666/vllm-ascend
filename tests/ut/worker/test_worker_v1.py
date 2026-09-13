@@ -273,6 +273,33 @@ class TestNPUWorker(TestBase):
                 with patch("vllm_ascend.worker.worker.get_kv_cache_groups", return_value=groups):
                     self.assertEqual(worker._scale_kv_cache_memory_for_multi_group(12345), expected_budget)
 
+    def test_mooncake_v1_supports_standardized_shared_kv_backing(self):
+        from vllm_ascend.worker.model_runner_v1 import (
+            supports_shared_kv_backing_with_transfer,
+        )
+
+        no_transfer_config = SimpleNamespace(kv_transfer_config=None)
+        mooncake_v1_config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="MooncakeConnectorV1",
+            )
+        )
+        unsupported_config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="UnsupportedConnector",
+            )
+        )
+
+        self.assertTrue(
+            supports_shared_kv_backing_with_transfer(no_transfer_config)
+        )
+        self.assertTrue(
+            supports_shared_kv_backing_with_transfer(mooncake_v1_config)
+        )
+        self.assertFalse(
+            supports_shared_kv_backing_with_transfer(unsupported_config)
+        )
+
     @unittest.skipIf(
         vllm_version_is("0.28.0"),
         "vLLM #51718 only changed the main planner",

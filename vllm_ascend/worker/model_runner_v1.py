@@ -314,6 +314,27 @@ def _count_nans_per_row(logits: torch.Tensor) -> torch.Tensor:
     return logits.isnan().sum(dim=-1).to(dtype=torch.int32)
 
 
+_STANDARDIZED_SHARED_KV_BACKING_CONNECTORS = frozenset(
+    {
+        "ExampleHiddenStatesConnector",
+        "MooncakeConnectorV1",
+        "MooncakeConnectorV2",
+        "MooncakePullConnector",
+    }
+)
+
+
+def supports_shared_kv_backing_with_transfer(vllm_config: VllmConfig) -> bool:
+    """Whether KV transfer can consume standardized shared-cache views."""
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is None:
+        return True
+    return (
+        getattr(kv_transfer_config, "kv_connector", None)
+        in _STANDARDIZED_SHARED_KV_BACKING_CONNECTORS
+    )
+
+
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -4568,23 +4589,11 @@ class NPUModelRunner(GPUModelRunner):
             isinstance(spec, MambaSpec) for spec in layer_kv_cache_spec.values()
         ) and any(isinstance(spec, AttentionSpec) for spec in layer_kv_cache_spec.values())
 
-        kv_transfer_config = self.vllm_config.kv_transfer_config
-        kv_connector = (
-            getattr(kv_transfer_config, "kv_connector", None)
-            if kv_transfer_config is not None
-            else None
-        )
-        # Mooncake V2 retains per-layer transfer metadata while registering the
-        # standardized Attention/Mamba backing allocation once. The example
-        # connector only consumes its dedicated cache-only layer.
+        # Mooncake connectors retain per-layer transfer metadata while
+        # registering the standardized Attention/Mamba backing allocation once.
+        # The example connector only consumes its dedicated cache-only layer.
         supports_shared_backing_with_kv_transfer = (
-            kv_transfer_config is None
-            or kv_connector
-            in {
-                "ExampleHiddenStatesConnector",
-                "MooncakeConnectorV2",
-                "MooncakePullConnector",
-            }
+            supports_shared_kv_backing_with_transfer(self.vllm_config)
         )
 
         # GLM-Next emits one descriptor for each physical cache slot. Layers
