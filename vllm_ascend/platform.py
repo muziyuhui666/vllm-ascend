@@ -1247,6 +1247,20 @@ def _setup_worker_and_scheduler(
         else:
             parallel_config.worker_cls = hardware_profile.default_worker_cls
 
+    # Local debug patch: print final SP state after backend fallback logic.   # ljf
+    if parallel_config:
+        additional_config = vllm_config.additional_config or {}
+        logger.warning(
+            "[SP_CHECK] enabled=%s, all2all_backend=%s, "
+            "tp_size=%s, enable_expert_parallel=%s, "
+            "flashcomm_compat_key=%s",
+            enable_sp(vllm_config),
+            parallel_config.all2all_backend,
+            parallel_config.tensor_parallel_size,
+            parallel_config.enable_expert_parallel,
+            additional_config.get("enable_flashcomm1", "<missing>"),
+        )
+
     refresh_block_size(vllm_config)
 
     # Automatically activate all custom ops on profiles using the standard path.
