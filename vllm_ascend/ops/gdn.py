@@ -67,12 +67,9 @@ def _chunk_gated_delta_rule_fla_npu(
     if keep_meta is not None:
         cu_seqlens = prebuilt_meta.cu_seqlens_kern
         initial_state_kern = initial_state[keep_meta]
-    
 
-    # print("q.shape=%s",q.shape)
-    # print("k.shape=%s",k.shape)
-    # print("v.shape=%s",v.shape)
-    output, final_state ,_ ,_ = fused_fwd(
+
+    output, final_state, _, _ = fused_fwd(
         q,
         k,
         v,
@@ -594,7 +591,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     initial_state=initial_state,
                     scale=key_non_spec.shape[-1] ** -0.5,
                     prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
-                    fused_fwd=ascend_config.gdn_prefill_op,
+                    fused_fwd=ascend_config._gdn_prefill_op,
                 )
                 ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
             # Use the fused CANN operator when available (probed once, cached on
