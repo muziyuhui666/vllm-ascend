@@ -401,7 +401,7 @@ class TestUtils(TestBase):
     def test_maybe_trans_nz(self, mock_npu_format_cast):
         from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
-        mock_npu_format_cast.side_effect = lambda weight, fmt: weight
+        mock_npu_format_cast.side_effect = lambda weight, fmt, **kwargs: weight
 
         def assert_nz_cast(weight):
             mock_npu_format_cast.assert_called_once()
@@ -509,6 +509,28 @@ class TestUtils(TestBase):
             result = utils.maybe_trans_nz(weight)
             self.assertIs(result, weight)
             assert_nz_cast(weight)
+
+        # Test case 8: FP8 dtype hints are forwarded to npu_format_cast.
+        mock_npu_format_cast.reset_mock()
+        mock_config.weight_nz_mode = 1
+        with (
+            mock.patch("vllm_ascend.utils.get_ascend_config", return_value=mock_config),
+            mock.patch(
+                "vllm_ascend.utils.get_current_hardware_profile",
+                return_value=get_hardware_profile(AscendDeviceType.A2),
+            ),
+        ):
+            weight = torch.empty(32, 64, dtype=torch.float8_e4m3fn)
+            result = utils.maybe_trans_nz(
+                weight,
+                customize_dtype=torch.float8_e4m3fn,
+            )
+            self.assertIs(result, weight)
+            mock_npu_format_cast.assert_called_once_with(
+                weight,
+                ACL_FORMAT_FRACTAL_NZ,
+                customize_dtype=torch.float8_e4m3fn,
+            )
 
 
 def test_is_pd_decode_recompute_scheduler_enabled_without_config():

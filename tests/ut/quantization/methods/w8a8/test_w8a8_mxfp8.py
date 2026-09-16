@@ -22,6 +22,9 @@ class TestAscendW8A8MXFP8LinearMethod(TestBase):
     def setUp(self, mock_vllm):
         mock_vllm.return_value = create_mock_vllm_config()
         self.scheme = AscendW8A8MXFP8DynamicLinearMethod()
+        nz_config = patch("vllm_ascend.utils.get_ascend_config", return_value=SimpleNamespace(weight_nz_mode=1))
+        self.addCleanup(nz_config.stop)
+        nz_config.start()
 
     def test_modelopt_config_defaults_group_size(self):
         vllm_config = create_mock_vllm_config()
@@ -79,7 +82,9 @@ class TestAscendW8A8MXFP8LinearMethod(TestBase):
         self.assertEqual(layer.weight_scale.shape, original_scale_shape)
         self.assertFalse(layer._mxfp8_transformed)
 
-    def test_transform_buffer_data_ptr_stable_across_reloads(self):
+    @patch("vllm_ascend.utils._should_trans_nz", return_value=True)
+    @patch("torch_npu.npu_format_cast", side_effect=lambda weight, fmt, **kwargs: weight.clone())
+    def test_transform_buffer_data_ptr_stable_across_reloads(self, mock_cast, mock_should_trans_nz):
         # The transformed buffer is what the ACL graph captures and replays.
         # It must keep a stable data_ptr across RL weight reloads so graph
         # replay never reads stale/freed memory and produces garbled output.
@@ -115,8 +120,27 @@ class TestAscendW8A8MXFP8LinearMethod(TestBase):
             self.assertTrue(layer._mxfp8_scale_buf.is_contiguous())
             self.assertTrue(layer.weight.data.is_contiguous())
             self.assertTrue(layer.weight_scale.data.is_contiguous())
+            torch.testing.assert_close(layer.weight.float(), new_w.T.float(), rtol=0, atol=0)
+            torch.testing.assert_close(layer.weight_scale, new_s.reshape(128, 4, 2).transpose(0, 1))
+        mock_cast.assert_called_once()
+        self.assertEqual(mock_cast.call_args.kwargs["customize_dtype"], torch.float8_e4m3fn)
 
-    def test_process_weights_preserves_unaligned_tp_group_phase(self):
+    @patch("torch_npu.npu_format_cast")
+    def test_fused_preprocess_owns_nz_conversion(self, mock_cast):
+        layer = nn.Module()
+        layer.weight = nn.Parameter(torch.randn(128, 256).to(torch.float8_e4m3fn), requires_grad=False)
+        layer.weight_scale = nn.Parameter(torch.ones(128, 8, dtype=torch.uint8), requires_grad=False)
+        layer._fused_preprocess_managed = True
+
+        self.scheme.process_weights_after_loading(layer)
+
+        self.assertEqual(layer.weight.shape, (256, 128))
+        self.assertEqual(layer.weight_scale.shape, (4, 128, 2))
+        mock_cast.assert_not_called()
+
+    @patch("vllm_ascend.utils._should_trans_nz", return_value=True)
+    @patch("torch_npu.npu_format_cast", side_effect=lambda weight, fmt, **kwargs: weight.clone())
+    def test_process_weights_preserves_unaligned_tp_group_phase(self, mock_cast, mock_should_trans_nz):
         layer = RowParallelLinear.__new__(RowParallelLinear)
         nn.Module.__init__(layer)
         original_weight = torch.randn(2, 528).to(torch.float8_e4m3fn)
@@ -131,6 +155,9 @@ class TestAscendW8A8MXFP8LinearMethod(TestBase):
         self.assertEqual(layer.weight.shape, (544, 2))
         torch.testing.assert_close(layer.weight[:16], torch.zeros(16, 2, dtype=torch.float8_e4m3fn))
         torch.testing.assert_close(layer.weight[16:], original_weight.transpose(0, 1))
+        mock_cast.assert_called_once()
+        self.assertEqual(mock_cast.call_args.args[0].shape, (544, 2))
+        self.assertTrue(mock_cast.call_args.args[0].is_contiguous())
 
     @patch("vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8.torch_npu")
     def test_apply(self, mock_torch_npu):
