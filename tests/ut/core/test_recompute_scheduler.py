@@ -17,6 +17,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
 )
 from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import EngineCoreOutput, FinishReason
@@ -525,6 +526,29 @@ def test_schedule_and_update_from_output_roundtrip():
     assert scheduler_output.recomputed_reqs == []
     assert request.status == RequestStatus.RUNNING
     assert request.client_index in outputs
+
+
+@pytest.mark.parametrize("use_v2_model_runner", [False, True])
+def test_schedule_propagates_rope_metadata_flags(use_v2_model_runner):
+    _, scheduler = _create_live_recompute_scheduler()
+    scheduler.use_v2_model_runner = use_v2_model_runner
+    scheduler.model_uses_mrope = True
+    scheduler.model_uses_xdrope = True
+    request = create_request(
+        request_id=1,
+        block_size=scheduler.vllm_config.cache_config.block_size,
+    )
+    scheduler.add_request(request)
+
+    with patch.object(
+        NewRequestData,
+        "from_request",
+        wraps=NewRequestData.from_request,
+    ) as from_request:
+        scheduler.schedule()
+
+    assert from_request.call_args.kwargs["uses_mrope"] is True
+    assert from_request.call_args.kwargs["uses_xdrope"] is True
 
 
 def test_schedule_paused_skips_waiting_requests():
