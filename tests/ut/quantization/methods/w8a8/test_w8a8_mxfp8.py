@@ -330,6 +330,32 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
                 self.assertEqual(cast.call_count, 2 if nz_enabled else 0)
 
     @patch("vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8.get_current_vllm_config")
+    @patch("vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8.use_cann_megamoe", return_value=True)
+    def test_mega_moe_reinterprets_scale_as_e8m0_without_changing_bits(
+        self, mock_use_cann_megamoe, mock_vllm
+    ):
+        layer = create_mxfp_moe_layer(
+            num_experts=self.num_experts,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+        )
+        expected_w13 = layer.w13_weight_scale.detach().clone()
+        g_num, n_size, k_size = expected_w13.shape
+        expected_w13 = expected_w13.reshape(g_num, n_size, k_size // 2, 2)
+        expected_w2 = layer.w2_weight_scale.detach().clone()
+        g_num, n_size, k_size = expected_w2.shape
+        expected_w2 = expected_w2.reshape(g_num, n_size, k_size // 2, 2)
+
+        self.scheme.process_weights_after_loading(layer)
+
+        for actual, expected in zip(layer.cann_mega_moe_w13_weight_scale_list, expected_w13.unbind(dim=0)):
+            self.assertEqual(actual.dtype, torch.float8_e8m0fnu)
+            torch.testing.assert_close(actual.view(torch.uint8), expected)
+        for actual, expected in zip(layer.cann_mega_moe_w2_weight_scale_list, expected_w2.unbind(dim=0)):
+            self.assertEqual(actual.dtype, torch.float8_e8m0fnu)
+            torch.testing.assert_close(actual.view(torch.uint8), expected)
+
+    @patch("vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8.get_current_vllm_config")
     @patch("vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8.use_cann_megamoe", return_value=False)
     def test_restore_weights_for_rl_loading(self, mock_use_cann_megamoe, mock_vllm):
         layer = create_mxfp_moe_layer(
