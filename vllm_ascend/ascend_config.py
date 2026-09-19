@@ -322,6 +322,7 @@ class AscendConfig:
             "enable_cpu_binding": true,
             "multistream_dsv4_dsa_overlap": true,
             "enable_prefill_mc2": false,
+            "gdn_prefill_backend": "auto",
             "multistream_overlap_shared_expert": false,
             "enable_kv_nz": false,
             "enable_mc2_hierarchy_comm": false,
@@ -457,6 +458,7 @@ class AscendConfig:
     enable_cpu_binding: bool = True
     multistream_dsv4_dsa_overlap: bool = True
     enable_prefill_mc2: bool = False
+    gdn_prefill_backend: Literal["auto", "native", "fla_npu"] = "auto"
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
@@ -530,9 +532,20 @@ class AscendConfig:
     _sparse_li_c8_layer_names: set[str] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_c8_layer_filter_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
     _c8_reshape_optim_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
+    _gdn_prefill_op: Any = dataclasses.field(default=None, init=False, repr=False)
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
+        if self.gdn_prefill_backend == "fla_npu":
+            try:
+                from fla_npu.ops.ascendc import chunk_gated_delta_rule_fwd
+            except ImportError as exc:
+                raise RuntimeError(
+                    "gdn_prefill_backend='fla_npu' requires a current "
+                    "flash-linear-attention-npu wheel providing "
+                    "fla_npu.ops.ascendc.chunk_gated_delta_rule_fwd."
+                ) from exc
+            self._gdn_prefill_op = chunk_gated_delta_rule_fwd
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.
@@ -1532,31 +1545,33 @@ def _is_ascend_config_initialized(config: AscendConfig | None) -> bool:
 
 
 def init_ascend_config(vllm_config):
-    additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+    additional_config = dict(vllm_config.additional_config) if vllm_config.additional_config is not None else {}
     if "enable_flashcomm1" in additional_config or os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1") is not None:
         logger.warning(
             "FlashComm is deprecated; remove enable_flashcomm1 and "
             "VLLM_ASCEND_ENABLE_FLASHCOMM1 from the configuration. Use upstream configuration instead"
         )
-    # Upstream EngineArgs injects --gdn-prefill-backend / --kda-prefill-backend
-    # into additional_config. The generic GDN/KDA model layers consume them
-    # (qwen_gdn_linear_attn / kimi_gdn_linear_attn), but on non-CUDA platforms
-    # only the triton path is available: the FLA Triton kernels run on Ascend
-    # via triton-ascend (the CUDA triton package is replaced in Ascend images).
-    # CUDA-only values (flashinfer/cutedsl for GDN, flashkda for KDA) have no
-    # kernel on Ascend. Strip the keys here so extra="forbid" does not reject
-    # them as typos, and warn only when the user requested an unsupported value.
-    _TRITON_COMPATIBLE_VALUES = ("auto", "triton")
-    for _prefill_key in ("gdn_prefill_backend", "kda_prefill_backend"):
-        _prefill_value = additional_config.get(_prefill_key)
-        if _prefill_value is not None and str(_prefill_value).strip().lower() not in _TRITON_COMPATIBLE_VALUES:
-            logger.warning_once(
-                "Ascend does not support %s=%r; only the 'triton' value is "
-                "available on Ascend for GDN/KDA prefill (FLA kernels run via "
-                "triton-ascend). The option is ignored.",
-                _prefill_key,
-                _prefill_value,
-            )
+    # Upstream EngineArgs injects these selectors into additional_config.
+    # Ascend owns the GDN selector because it also provides the optional
+    # flash-linear-attention-npu backend. KDA still supports only Triton.
+    gdn_prefill_backend = str(additional_config.get("gdn_prefill_backend", "auto")).strip().lower()
+    if gdn_prefill_backend == "triton":
+        additional_config["gdn_prefill_backend"] = "native"
+    elif gdn_prefill_backend not in ("auto", "native", "fla_npu"):
+        logger.warning_once(
+            "Ascend does not support gdn_prefill_backend=%r; expected one of "
+            "'auto', 'native', 'triton', or 'fla_npu'. Falling back to 'auto'.",
+            gdn_prefill_backend,
+        )
+        additional_config["gdn_prefill_backend"] = "auto"
+
+    kda_prefill_backend = additional_config.get("kda_prefill_backend")
+    if kda_prefill_backend is not None and str(kda_prefill_backend).strip().lower() not in ("auto", "triton"):
+        logger.warning_once(
+            "Ascend does not support kda_prefill_backend=%r; only the 'triton' "
+            "value is available on Ascend. The option is ignored.",
+            kda_prefill_backend,
+        )
 
     refresh = validate_additional_config_bool(additional_config.get("refresh", False), "additional_config.refresh")
     raw_rl_config = additional_config.get("rl_config", {})
@@ -1593,12 +1608,8 @@ def init_ascend_config(vllm_config):
     _NON_USER_INPUT_KEYS = {
         # control-flow flag (singleton/cache refresh), not a configuration field
         "refresh",
-        # Upstream-injected by EngineArgs for the generic GDN/KDA prefill
-        # backend selector; Ascend supports only the triton value (FLA kernels
-        # run via triton-ascend), and the triton default applies either way
-        # (warned above when the user requested a CUDA-only value). Strip
-        # instead of letting extra="forbid" report them as typos.
-        "gdn_prefill_backend",
+        # Upstream-injected KDA selector. Ascend supports only Triton, so the
+        # value is validated above and stripped before schema validation.
         "kda_prefill_backend",
         # Removed upstream option: warn above, but do not pass it into the
         # strict AscendConfig schema where it would be reported as a typo.
@@ -1626,6 +1637,7 @@ def init_ascend_config(vllm_config):
         "_sparse_li_c8_layer_ids",
         "_sparse_li_c8_layer_names",
         "_sparse_li_c8_layer_filter_enabled",
+        "_gdn_prefill_op",
         # SchedulerConfig-internal top-level legacy keys (resolved internally,
         # then replaced by the typed scheduler_config passed above).
         "enable_balance_scheduling",

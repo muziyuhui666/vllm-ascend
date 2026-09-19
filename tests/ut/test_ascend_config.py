@@ -18,7 +18,7 @@ import os
 import subprocess
 import sys
 from importlib.util import find_spec as real_find_spec
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -226,9 +226,8 @@ class TestAscendConfig(TestBase):
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_init_ascend_config_warns_unsupported_prefill_backend(self, mock_fix_incompatible_config, mock_logger):
         # Upstream EngineArgs injects --gdn-prefill-backend / --kda-prefill-backend
-        # into additional_config. Only the 'triton' value (FLA kernels run via
-        # triton-ascend) exists on Ascend, so CUDA-only values must be stripped
-        # with a warning instead of being rejected as typos by extra="forbid".
+        # into additional_config. CUDA-only values must fall back cleanly
+        # instead of being rejected as typos by extra="forbid".
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
             "gdn_prefill_backend": "flashinfer",
@@ -237,6 +236,7 @@ class TestAscendConfig(TestBase):
         # extra="forbid" would raise if the injected keys reached AscendConfig.
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertIsNotNone(ascend_config)
+        self.assertEqual(ascend_config.gdn_prefill_backend, "auto")
 
         prefill_warnings = [
             call for call in mock_logger.warning_once.call_args_list if "does not support" in str(call.args[0])
@@ -251,8 +251,7 @@ class TestAscendConfig(TestBase):
     @patch("vllm_ascend.ascend_config.logger")
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_init_ascend_config_silent_triton_prefill_backend(self, mock_fix_incompatible_config, mock_logger):
-        # 'triton'/'auto' are the Ascend-supported values; they are stripped
-        # silently (equivalent to the default) without any warning.
+        # 'triton' is accepted as an alias for Ascend's native Triton backend.
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
             "gdn_prefill_backend": "triton",
@@ -260,11 +259,47 @@ class TestAscendConfig(TestBase):
         }
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertIsNotNone(ascend_config)
+        self.assertEqual(ascend_config.gdn_prefill_backend, "native")
 
         prefill_warnings = [
             call for call in mock_logger.warning_once.call_args_list if "does not support" in str(call.args[0])
         ]
         self.assertEqual(prefill_warnings, [])
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_loads_fla_npu_prefill_backend(self, mock_fix_incompatible_config):
+        def fused_fwd(*args, **kwargs):
+            return None
+        fla_npu = ModuleType("fla_npu")
+        fla_npu_ops = ModuleType("fla_npu.ops")
+        fla_npu_ascendc = ModuleType("fla_npu.ops.ascendc")
+        fla_npu_ascendc.chunk_gated_delta_rule_fwd = fused_fwd
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"gdn_prefill_backend": "fla_npu"}
+
+        with patch.dict(
+            sys.modules,
+            {
+                "fla_npu": fla_npu,
+                "fla_npu.ops": fla_npu_ops,
+                "fla_npu.ops.ascendc": fla_npu_ascendc,
+            },
+        ):
+            ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertEqual(ascend_config.gdn_prefill_backend, "fla_npu")
+        self.assertIs(ascend_config._gdn_prefill_op, fused_fwd)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_requires_fla_npu_wheel(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"gdn_prefill_backend": "fla_npu"}
+
+        with patch.dict(sys.modules, {"fla_npu": None}):
+            with self.assertRaisesRegex(RuntimeError, "flash-linear-attention-npu"):
+                init_ascend_config(test_vllm_config)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.ascend_config.logger")

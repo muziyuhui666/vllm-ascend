@@ -28,10 +28,47 @@ from vllm.model_executor.model_loader.reload import (
 
 from vllm_ascend.ops.gdn import (
     _PACKED_CONV_WEIGHT_NAME,
+    _chunk_gated_delta_rule_fla_npu,
     _get_base_conv1d,
     _get_packed_conv_weights,
     initialize_packed_conv_weight,
 )
+
+
+def test_fla_npu_prefill_adapter_uses_prebuilt_metadata():
+    tensors = [torch.randn(2, 3, 4) for _ in range(5)]
+    initial_state = torch.randn(2, 3, 4, 4)
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    chunk_indices = torch.tensor([[0, 0]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        cu_seqlens_host=cu_seqlens,
+        chunk_indices_chunk64_host=chunk_indices,
+        keep_meta=None,
+    )
+    final_state = torch.randn_like(initial_state)
+    calls = []
+
+    def fused_fwd(*args, **kwargs):
+        calls.append((args, kwargs))
+        return args[2], final_state, None, None
+
+    output, actual_final_state = _chunk_gated_delta_rule_fla_npu(
+        *tensors,
+        initial_state=initial_state,
+        scale=0.5,
+        prebuilt_meta=metadata,
+        fused_fwd=fused_fwd,
+    )
+
+    assert output is tensors[2]
+    assert actual_final_state is final_state
+    assert len(calls) == 1
+    _, kwargs = calls[0]
+    assert kwargs["cu_seqlens"] is cu_seqlens
+    assert kwargs["chunk_indices"] is chunk_indices
+    assert kwargs["chunk_size"] == 64
+    assert kwargs["layout"] == "BSND"
+    assert kwargs["disable_recompute"] is True
 
 
 class _RecordingQuantMethod(QuantizeMethodBase):
