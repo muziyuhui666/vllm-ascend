@@ -659,6 +659,7 @@ def build_attn_metadata(
                         **attn_metadata_extra_kwargs,
                     )
                 if isinstance(attn_metadata_builder, QSAMetadataBuilder):
+                    metadata.qsa_num_live_requests = num_actual_reqs
                     # Preserve live prefixes for graph-padded inputs without
                     # reading device lengths back on the host.
                     metadata.qsa_num_live_tokens = int(variant_common.query_start_loc_cpu[num_actual_reqs])
