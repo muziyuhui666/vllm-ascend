@@ -72,6 +72,9 @@ def _dump_gmm_group_list(
 
     if os.getenv("VLLM_ASCEND_DUMP_GMM_GLIST", "0") != "1":
         return
+    trigger_file = os.getenv("VLLM_ASCEND_DUMP_GMM_GLIST_TRIGGER_FILE")
+    if trigger_file and not Path(trigger_file).is_file():
+        return
     if group_list is None or group_list_type not in (0, 1):
         return
 
