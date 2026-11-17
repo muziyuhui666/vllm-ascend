@@ -85,6 +85,16 @@ def _dump_gmm_group_list(
         if rank not in allowed_ranks:
             return
 
+    raw = group_list.detach().to(device="cpu", dtype=torch.int64)
+    counts = raw if group_list_type == 1 else torch.cat((raw[:1], torch.diff(raw)))
+    total_expert_tokens = int(counts.sum().item())
+    min_tokens = int(os.getenv("VLLM_ASCEND_DUMP_GMM_GLIST_MIN_TOKENS", "0"))
+    max_tokens = int(os.getenv("VLLM_ASCEND_DUMP_GMM_GLIST_MAX_TOKENS", "0"))
+    if total_expert_tokens < min_tokens or (
+        max_tokens > 0 and total_expert_tokens > max_tokens
+    ):
+        return
+
     max_calls = int(os.getenv("VLLM_ASCEND_DUMP_GMM_GLIST_MAX_CALLS", "256"))
     with _GMM_GLIST_DUMP_LOCK:
         if _GMM_GLIST_DUMP_CALLS >= max_calls:
@@ -92,8 +102,6 @@ def _dump_gmm_group_list(
         call_index = _GMM_GLIST_DUMP_CALLS
         _GMM_GLIST_DUMP_CALLS += 1
 
-    raw = group_list.detach().to(device="cpu", dtype=torch.int64)
-    counts = raw if group_list_type == 1 else torch.cat((raw[:1], torch.diff(raw)))
     counts_f64 = counts.to(torch.float64)
     nonzero = counts[counts > 0]
     mean = counts_f64.mean().item() if counts.numel() else 0.0
@@ -118,7 +126,7 @@ def _dump_gmm_group_list(
         "group_list_semantics": "count" if group_list_type == 1 else "cumsum",
         "hidden_shape": list(hidden_states.shape),
         "num_experts": counts.numel(),
-        "total_expert_tokens": int(counts.sum().item()),
+        "total_expert_tokens": total_expert_tokens,
         "nonzero_experts": int((counts > 0).sum().item()),
         "min_count": int(counts.min().item()) if counts.numel() else 0,
         "max_count": int(counts.max().item()) if counts.numel() else 0,
