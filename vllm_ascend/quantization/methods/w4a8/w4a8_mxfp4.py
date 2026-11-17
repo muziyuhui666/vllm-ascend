@@ -40,6 +40,7 @@ from ..base import (
     WeightSwitchGatherSpec,
 )
 from ..registry import register_scheme
+from .w4a8 import _dump_gmm_group_list
 
 # CANN uses 36 to select FP8 E4M3FN output for situ_mx_quant.
 SITU_MX_DST_TYPE_E4M3FN = 36
@@ -418,6 +419,13 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         hidden_states, pertoken_scale = self._quant_hidden_states(hidden_states, mlp_compute_input.dynamic_scale)
         layer = mlp_compute_input.layer
         assert layer is not None
+        _dump_gmm_group_list(
+            "mxfp_gmm1_act_quant",
+            mlp_compute_input.group_list,
+            mlp_compute_input.group_list_type,
+            hidden_states,
+            layer,
+        )
         if (
             mlp_compute_input.activation == MoEActivation.SITU
             and mlp_compute_input.group_list_type in (0, 1)
@@ -500,6 +508,13 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         hidden_states, pertoken_scale = self._quant_hidden_states(hidden_states, mlp_compute_input.dynamic_scale)
         layer = mlp_compute_input.layer
         assert layer is not None
+        _dump_gmm_group_list(
+            "mxfp_gmm1",
+            mlp_compute_input.group_list,
+            mlp_compute_input.group_list_type,
+            hidden_states,
+            layer,
+        )
         w1, w1_scale, _, _ = self._get_mlp_weights(layer)
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
@@ -525,6 +540,13 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
     def apply_gmm2(self, mlp_compute_input: MoEMlpComputeInput, hidden_states, act_out_scale):
         layer = mlp_compute_input.layer
         assert layer is not None
+        _dump_gmm_group_list(
+            "mxfp_gmm2",
+            mlp_compute_input.group_list,
+            mlp_compute_input.group_list_type,
+            hidden_states,
+            layer,
+        )
         _, _, w2, w2_scale = self._get_mlp_weights(layer)
         input_dtype = mlp_compute_input.hidden_states.dtype
         use_bf16 = input_dtype in [torch.bfloat16, torch.float8_e4m3fn]
