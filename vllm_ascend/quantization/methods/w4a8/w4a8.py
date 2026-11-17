@@ -15,6 +15,11 @@
 # limitations under the License.
 #
 
+import json
+import os
+import threading
+import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -45,6 +50,88 @@ _INT4_VALUES_PER_BYTE = 2
 _INT4_VALUES_PER_INT32 = 8
 _INT4_NZ_OUTPUT_ALIGNMENT = 64
 _INT4_NZ_INPUT_ALIGNMENT = 16
+
+_GMM_GLIST_DUMP_LOCK = threading.Lock()
+_GMM_GLIST_DUMP_CALLS = 0
+
+
+def _dump_gmm_group_list(
+    stage: str,
+    group_list: torch.Tensor | None,
+    group_list_type: int | None,
+    hidden_states: torch.Tensor,
+    layer: Any,
+) -> None:
+    """Dump the real grouped-matmul GLIST for short diagnostic runs.
+
+    This deliberately performs an NPU-to-CPU copy and must never be enabled for
+    performance measurements. Set ``VLLM_ASCEND_DUMP_GMM_GLIST=1`` to enable it.
+    Output is bounded per process by ``VLLM_ASCEND_DUMP_GMM_GLIST_MAX_CALLS``.
+    """
+    global _GMM_GLIST_DUMP_CALLS
+
+    if os.getenv("VLLM_ASCEND_DUMP_GMM_GLIST", "0") != "1":
+        return
+    if group_list is None or group_list_type not in (0, 1):
+        return
+
+    rank = int(os.getenv("RANK", os.getenv("LOCAL_RANK", "-1")))
+    selected_ranks = os.getenv("VLLM_ASCEND_DUMP_GMM_GLIST_RANKS", "0")
+    if selected_ranks.strip() not in ("", "all", "*"):
+        allowed_ranks = {int(item) for item in selected_ranks.split(",")}
+        if rank not in allowed_ranks:
+            return
+
+    max_calls = int(os.getenv("VLLM_ASCEND_DUMP_GMM_GLIST_MAX_CALLS", "256"))
+    with _GMM_GLIST_DUMP_LOCK:
+        if _GMM_GLIST_DUMP_CALLS >= max_calls:
+            return
+        call_index = _GMM_GLIST_DUMP_CALLS
+        _GMM_GLIST_DUMP_CALLS += 1
+
+    raw = group_list.detach().to(device="cpu", dtype=torch.int64)
+    counts = raw if group_list_type == 1 else torch.cat((raw[:1], torch.diff(raw)))
+    counts_f64 = counts.to(torch.float64)
+    nonzero = counts[counts > 0]
+    mean = counts_f64.mean().item() if counts.numel() else 0.0
+    std = counts_f64.std(unbiased=False).item() if counts.numel() else 0.0
+    record = {
+        "timestamp_ns": time.time_ns(),
+        "pid": os.getpid(),
+        "rank": rank,
+        "local_rank": int(os.getenv("LOCAL_RANK", "-1")),
+        "call_index": call_index,
+        "stage": stage,
+        "layer_class": type(layer).__name__,
+        "layer_index": next(
+            (
+                getattr(layer, name)
+                for name in ("layer_idx", "layer_id")
+                if hasattr(layer, name)
+            ),
+            None,
+        ),
+        "group_list_type": group_list_type,
+        "group_list_semantics": "count" if group_list_type == 1 else "cumsum",
+        "hidden_shape": list(hidden_states.shape),
+        "num_experts": counts.numel(),
+        "total_expert_tokens": int(counts.sum().item()),
+        "nonzero_experts": int((counts > 0).sum().item()),
+        "min_count": int(counts.min().item()) if counts.numel() else 0,
+        "max_count": int(counts.max().item()) if counts.numel() else 0,
+        "mean_count": mean,
+        "std_count": std,
+        "max_over_mean": float(counts.max().item() / mean) if mean else 0.0,
+        "nonzero_min_count": int(nonzero.min().item()) if nonzero.numel() else 0,
+        "raw_group_list": raw.tolist(),
+        "expert_counts": counts.tolist(),
+    }
+
+    output_dir = Path(os.getenv("VLLM_ASCEND_DUMP_GMM_GLIST_DIR", "/tmp/gmm_glist"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / f"gmm_glist_rank{rank}_pid{os.getpid()}.jsonl"
+    with output_file.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
 @register_scheme("W4A8_DYNAMIC", "moe")
@@ -460,6 +547,9 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         w1, w1_scale, _, w2_scale = self._get_mlp_weights(layer)
         bias1, _ = self._get_mlp_scale_bias(layer)
         group_list, group_list_type = self._maybe_convert_group_list(mlp_compute_input)
+        _dump_gmm_group_list(
+            "gmm1_act_quant", group_list, group_list_type, hidden_states, layer
+        )
 
         if mlp_compute_input.activation == MoEActivation.SITU:
             # SituAndMul: run the dequantized gmm1 first, then fuse the situ
@@ -522,6 +612,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         w1, w1_scale, _, w2_scale = self._get_mlp_weights(layer)
         bias1, _ = self._get_mlp_scale_bias(layer)
         group_list, group_list_type = self._maybe_convert_group_list(mlp_compute_input)
+        _dump_gmm_group_list("gmm1", group_list, group_list_type, hidden_states, layer)
         scale = [w1_scale[0].to(w2_scale[0].dtype)]
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
@@ -545,6 +636,13 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         _, _, w2, w2_scale = self._get_mlp_weights(mlp_compute_input.layer)
         _, bias2 = self._get_mlp_scale_bias(mlp_compute_input.layer)
         group_list, group_list_type = self._maybe_convert_group_list(mlp_compute_input)
+        _dump_gmm_group_list(
+            "gmm2",
+            group_list,
+            group_list_type,
+            hidden_states,
+            mlp_compute_input.layer,
+        )
         return torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=w2,
