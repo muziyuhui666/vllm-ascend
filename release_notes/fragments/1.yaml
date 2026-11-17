@@ -1,0 +1,4 @@
+pr: 1
+entries:
+  - category: performance
+    text: Increased the Qwen3.8-Flash-Next LightningIndexerV2 page size to 128 compressed keys on MRV2.
