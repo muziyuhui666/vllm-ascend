@@ -1,61 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Check union membership against the original per-query sparse selection."""
+"""Check batched and multi-head Union GBSA integration."""
 
 import pytest
 import torch
 import torch_npu  # noqa: F401
 
-from vllm_ascend.models.qwen4_exp.attention_dispatch import build_qsa_request_plan, dispatch_qsa_attention
-from vllm_ascend.models.qwen4_exp.gbsa_union import build_qsa_union_inputs, qsa_union_gbsa_attention
+from vllm_ascend.models.qwen4_exp.attention_dispatch import (
+    build_qsa_request_plan,
+    dispatch_qsa_attention,
+    prepare_qsa_union_batches,
+)
+from vllm_ascend.models.qwen4_exp.gbsa_union import build_qsa_union_inputs_from_compact, qsa_union_gbsa_attention
+from vllm_ascend.utils import enable_custom_op
 
 
-@pytest.mark.parametrize("rows,topk", [(1, 8), (7, 8), (8, 8), (9, 8), (17, 512)])
-@pytest.mark.parametrize("base_group", [0, (1 << 21) - 1024])
-def test_union_preserves_exact_membership(rows, topk, base_group):
-    generator = torch.Generator().manual_seed(811)
-    indices = torch.randint(0, 1024, (1, rows, topk), generator=generator, dtype=torch.int32) + base_group
-    counts = torch.randint(0, topk + 1, (1, rows), generator=generator, dtype=torch.int32)
-    visible = torch.arange(rows, dtype=torch.int32) + 4000 + base_group * 4
-    # Include empty rows, duplicate selections, padding and partial final groups.
-    counts[0, 0] = 0
-    for row in range(rows):
-        indices[0, row, counts[0, row] :] = -1
-    actual = build_qsa_union_inputs(indices.npu(), counts.npu(), visible.npu())
-    union_idx, union_count, exact = [tensor.cpu() for tensor in actual]
-    for group in range((rows + 7) // 8):
-        start, end = group * 8, min(rows, group * 8 + 8)
-        selected = [set(indices[0, row, : counts[0, row]].tolist()) for row in range(start, end)]
-        expected_union = sorted(set().union(*selected))
-        count = int(union_count[0, group])
-        assert count == len(expected_union)
-        assert union_idx[0, group, :count].tolist() == expected_union
-        assert (union_idx[0, group, count:] == -1).all()
-        for rank, block in enumerate(expected_union):
-            for lane in range(4):
-                expected = sum(
-                    1 << query_lane
-                    for query_lane, blocks in enumerate(selected)
-                    if block in blocks and block * 4 + lane < int(visible[start + query_lane])
-                )
-                assert int(exact[0, group, rank * 4 + lane]) == expected
-        assert (exact[0, group, count * 4 :] == 0).all()
-
-
-def test_large_union_matches_cpu_reference():
-    # Exercise the expanded scatter index at the real chunk shape. Keeping that
-    # index contiguous is required by the current A3 backend at this size.
-    rows, topk = 4096, 512
-    indices = torch.empty((1, rows, topk), dtype=torch.int32)
-    indices[0, :, :384] = torch.arange(384, dtype=torch.int32)
-    indices[0, :, 384:] = (
-        512 + torch.arange(rows, dtype=torch.int32).remainder(8)[:, None] * 128 + torch.arange(128, dtype=torch.int32)
-    )
-    counts = torch.full((1, rows), topk, dtype=torch.int32)
-    visible = torch.arange(rows, dtype=torch.int32) + 126977
-    expected = build_qsa_union_inputs(indices, counts, visible)
-    actual = build_qsa_union_inputs(indices.npu(), counts.npu(), visible.npu())
-    for reference, candidate in zip(expected, actual):
-        assert torch.equal(reference, candidate.cpu())
+def test_qsa_union_inputs_meta_rejects_non_power_of_two_width():
+    enable_custom_op()
+    compact = torch.empty((8, 11), device="meta", dtype=torch.int32)
+    visible = torch.empty(8, device="meta", dtype=torch.int32)
+    row_map = torch.empty((1, 8), device="meta", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="positive power of two"):
+        build_qsa_union_inputs_from_compact(compact, visible, row_map)
 
 
 @pytest.mark.parametrize("query_lengths", [(1, 7, 8, 9, 15, 16, 17, 19), (512,) * 8])
@@ -82,6 +47,18 @@ def test_batched_prefill_dispatch_matches_single_request_launches(query_lengths)
     actual = torch.empty_like(query)
     for request, (start, end) in enumerate(zip(starts, starts[1:])):
         rows = slice(start, end)
+        single_plan = build_qsa_request_plan(
+            torch.tensor([0, end - start]),
+            lengths_cpu[request : request + 1],
+            end - start,
+            torch.tensor([True]),
+        )
+        single_plan = prepare_qsa_union_batches(
+            single_plan,
+            positions[rows] + 1,
+            lengths[request : request + 1],
+            table[request : request + 1],
+        )
         qsa_union_gbsa_attention(
             query[rows],
             key,
@@ -93,8 +70,50 @@ def test_batched_prefill_dispatch_matches_single_request_launches(query_lengths)
             lengths,
             expected[rows],
             request_index=request,
+            prepared=single_plan.prepared_union_batches[0],
         )
     plan = build_qsa_request_plan(torch.tensor(starts), lengths_cpu, total, torch.ones(8, dtype=torch.bool))
-    assert len(plan.union_batches) == 1
+    plan = prepare_qsa_union_batches(plan, positions + 1, lengths, table)
     dispatch_qsa_attention(query, None, None, key, value, compact, table, requests, positions, lengths, actual, plan)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("query_lengths", [(17,), (9, 16)])
+def test_multi_kv_heads_match_independent_head_launches(query_lengths):
+    torch.manual_seed(811)
+    starts = [0]
+    for size in query_lengths:
+        starts.append(starts[-1] + size)
+    batch = len(query_lengths)
+    lengths_cpu = torch.arange(batch, dtype=torch.int32) * 5 + 32768
+    pages = (int(lengths_cpu.max()) + 127) // 128
+    q = torch.randn(starts[-1], 24, 256, dtype=torch.bfloat16, device="npu")
+    k = torch.randn(batch * pages, 128, 2, 256, device="npu", dtype=q.dtype)
+    v = torch.randn_like(k)
+    table = torch.randperm(batch * pages, dtype=torch.int32, device="npu").reshape(batch, pages)
+    lens = lengths_cpu.npu()
+    pos = torch.cat([torch.arange(int(kv) - size, int(kv)) for kv, size in zip(lengths_cpu, query_lengths)]).int().npu()
+    req = torch.repeat_interleave(torch.arange(batch, dtype=torch.int32), torch.tensor(query_lengths)).npu()
+    compact = torch.full((starts[-1], 515), -1, device="npu", dtype=torch.int32)
+    compact[:, :512] = torch.randint(0, 8000, (starts[-1], 512), device="npu", dtype=torch.int32)
+    plan = build_qsa_request_plan(torch.tensor(starts), lengths_cpu, starts[-1], torch.ones(batch, dtype=torch.bool))
+    plan = prepare_qsa_union_batches(plan, pos + 1, lens, table)
+
+    def run(query, key, value):
+        output = torch.full_like(query, float("nan"))
+        dispatch_qsa_attention(query, None, None, key, value, compact, table, req, pos, lens, output, plan)
+        return output
+
+    expected = torch.cat(
+        [
+            run(
+                q[:, h * 12 : (h + 1) * 12].contiguous(),
+                k[:, :, h : h + 1].contiguous(),
+                v[:, :, h : h + 1].contiguous(),
+            )
+            for h in range(2)
+        ],
+        dim=1,
+    )
+    actual = run(q, k, v)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
