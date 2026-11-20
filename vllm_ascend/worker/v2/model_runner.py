@@ -112,6 +112,7 @@ from vllm_ascend.utils import (
     create_hccl_pg_options,
     enable_sfa_dcp_sharded_indexer,
     enable_sp,
+    get_pcp_profile_num_tokens,
     is_c8_mxfp_kv_quant,
     is_deepseek_v41,
     lmhead_tp_enable,
