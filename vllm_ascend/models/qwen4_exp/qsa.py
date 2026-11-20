@@ -1135,6 +1135,7 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
             self.attn_output_gate
             and qkv.dtype == torch.bfloat16
             and qkv.ndim == 2
+            and qkv.is_contiguous()
             and qkv.shape[1] == 2 * self.q_size + 2 * self.kv_size
             and self.num_heads > 0
             and self.num_kv_heads > 0
@@ -1162,14 +1163,12 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
         # decomposition for MTP.
         # ForwardContext has no draft-model flag. The layer name is fixed when
         # the target or MTP model is built and remains stable during graph replay.
-        if self.layer_name.startswith("mtp."):
+        if self.layer_name.startswith("mtp.") or not self._main_fused_norm_rope_eligible(qkv, positions):
             q, k, v, projected_gate = super()._project_qkv_gate(qkv, positions)
             if gate_out is not None and projected_gate is not None:
                 gate_out.copy_(projected_gate.view_as(gate_out))
                 projected_gate = gate_out.view(projected_gate.shape)
             return q, k, v, projected_gate
-        if not self._main_fused_norm_rope_eligible(qkv, positions):
-            raise ValueError("QSA main-attention fused norm+RoPE ABI is not satisfied")
 
         # Pass the full rotary table and positions into the Triton kernel.  It
         # clamps and gathers each row while loading Q/K, removing the Prefill

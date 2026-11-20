@@ -47,7 +47,11 @@ from vllm_ascend.attention.gdn import (
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_reduce_scatter
-from vllm_ascend.models.qwen_gdn_recoverssm import _uses_gdn_recoverssm
+from vllm_ascend.models.qwen_gdn_recoverssm import (
+    _uses_gdn_recoverssm,
+    gdn_mamba_state_dtype_from_config,
+    gdn_mamba_state_shape_from_config,
+)
 from vllm_ascend.ops.gdn_checkpoint import initialize_gdn_checkpoints
 
 _GDN_PATCH_TARGET = _GDNBaseCls
