@@ -1009,7 +1009,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
         # 2. Partition raw gate projections along their token dimension.
-        if spec_sequence_masks is not None:
+        if has_spec_decode:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 a_spec, b_spec = a, b
                 a_non_spec, b_non_spec = None, None
@@ -1026,7 +1026,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_decode_tokens = attn_metadata.num_decode_tokens
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if has_spec_decode:
             use_upstream_recurrent = attn_metadata.spec_decode_metadata.use_upstream_recurrent or (
                 spec_state_indices_tensor.ndim == 2 and spec_state_indices_tensor.shape[1] > _MAX_RECURRENT_GDN_TOKENS
             )
@@ -1253,7 +1253,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             merged_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             recurrent_out = merged_out.squeeze(0)
-        elif spec_sequence_masks is not None:
+        elif has_spec_decode:
             recurrent_out = core_attn_out_spec.squeeze(0)
         else:
             recurrent_out = core_attn_out_non_spec.squeeze(0)

@@ -517,7 +517,11 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
     ) -> torch.Tensor:
         logger.info_once(
             "QSA is using native request-batched CANN LightningIndexerV2 (page_size=%d).",
-            self.compressed_key_cache.kv_cache.shape[1],
+            (
+                self.compressed_key_cache.kv_cache.shape[1]
+                if self.compressed_key_cache.kv_cache.ndim > 1
+                else GBSA_PAGE_SIZE
+            ),
         )
         return qsa_select_paged_tokens_lightning_v2(
             query,
@@ -1164,8 +1168,11 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
         # ForwardContext has no draft-model flag. The layer name is fixed when
         # the target or MTP model is built and remains stable during graph replay.
         if self.layer_name.startswith("mtp.") or not self._main_fused_norm_rope_eligible(qkv, positions):
-            q, k, v, projected_gate = super()._project_qkv_gate(qkv, positions)
-            if gate_out is not None and projected_gate is not None:
+            result = super()._project_qkv_gate(qkv, positions)
+            if gate_out is None:
+                return result
+            q, k, v, projected_gate = result
+            if projected_gate is not None:
                 gate_out.copy_(projected_gate.view_as(gate_out))
                 projected_gate = gate_out.view(projected_gate.shape)
             return q, k, v, projected_gate
@@ -1242,7 +1249,7 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
         # Q/K/V preparation and indexer paths, so materialize the same outputs
         # here before entering the existing cache/update transaction.
         if qkv is not None:
-            q, k, v, projected_gate = self._project_qkv_gate(qkv, positions)
+            q, k, v, projected_gate = self._project_qkv_gate(qkv, positions, gate)
             query = q.view(-1, self.num_heads, self.head_dim)
             key = k.view(-1, self.num_kv_heads, self.head_dim)
             value = v.view(-1, self.num_kv_heads, self.head_dim)
