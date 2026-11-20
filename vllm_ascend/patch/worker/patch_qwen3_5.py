@@ -40,14 +40,14 @@ except ImportError:
     IntermediateTensors = None
 from vllm.model_executor.models.qwen3_next import Qwen3NextForCausalLM
 
-from vllm_ascend.attention.gdn import AscendGatedDeltaNetAttention, initialize_packed_conv_weight
+from vllm_ascend.attention.gdn import (
+    AscendGatedDeltaNetAttention,
+    initialize_packed_conv_weight,
+    initialize_recurrent_fp32_parameters,
+)
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_reduce_scatter
-from vllm_ascend.models.qwen_gdn_recoverssm import (
-    _uses_gdn_recoverssm,
-    gdn_mamba_state_dtype_from_config,
-    gdn_mamba_state_shape_from_config,
-)
+from vllm_ascend.models.qwen_gdn_recoverssm import _uses_gdn_recoverssm
 from vllm_ascend.ops.gdn_checkpoint import initialize_gdn_checkpoints
 
 _GDN_PATCH_TARGET = _GDNBaseCls
@@ -415,6 +415,7 @@ if get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PA
     def _gdn_init_with_packed_weight(self, *args, **kwargs):
         _GDN_ORIGINAL_INIT(self, *args, **kwargs)
         self.use_gdn_recoverssm = _uses_gdn_recoverssm(self.vllm_config)
+        initialize_recurrent_fp32_parameters(self)
         initialize_packed_conv_weight(self)
         initialize_gdn_checkpoints(self)
 

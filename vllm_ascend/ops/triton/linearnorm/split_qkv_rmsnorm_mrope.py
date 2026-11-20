@@ -20,6 +20,7 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend.ops.triton.linearnorm.qsa_rope_utils import validate_qsa_rope_positions
 from vllm_ascend.ops.triton.triton_utils import extract_slice, get_vectorcore_num, insert_slice
 
 
@@ -75,6 +76,7 @@ def split_qkv_rmsnorm_mrope_kernel(
     half_rope_dim: tl.constexpr,
     IS_PARTIAL_ROPE: tl.constexpr,
     gate_size: tl.constexpr,
+    weight_offset: tl.constexpr,
     positions_ptr=None,
     position_stride_axis: tl.constexpr = 0,
     position_stride_token: tl.constexpr = 0,
@@ -96,6 +98,15 @@ def split_qkv_rmsnorm_mrope_kernel(
 
     q_rmsnorm_weight = tl.load(q_weight_ptr + tl.arange(0, head_size))
     k_rmsnorm_weight = tl.load(k_weight_ptr + tl.arange(0, head_size))
+    if weight_offset != 0.0:
+        weight_dtype = q_weight_ptr.dtype.element_ty
+        q_rmsnorm_weight = (q_rmsnorm_weight.to(tl.float32) + weight_offset).to(weight_dtype)
+        k_rmsnorm_weight = (k_rmsnorm_weight.to(tl.float32) + weight_offset).to(weight_dtype)
+
+    if GATHER_CACHE and weight_offset == 0.0:
+        # Match (1 + weight) in the parameter dtype, including BF16 rounding.
+        q_rmsnorm_weight = (q_rmsnorm_weight.to(tl.float32) + 1.0).to(q_rmsnorm_weight.dtype)
+        k_rmsnorm_weight = (k_rmsnorm_weight.to(tl.float32) + 1.0).to(k_rmsnorm_weight.dtype)
 
     if GATHER_CACHE:
         # Match (1 + weight) in the parameter dtype, including BF16 rounding.
@@ -317,7 +328,7 @@ def split_qkv_rmsnorm_mrope_kernel(
             tl.store(out_gate_offset + tl.arange(0, gate_size), in_gate_tensor)
 
 
-def triton_split_qkv_rmsnorm_mrope(
+def _triton_split_qkv_rmsnorm_mrope(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
@@ -333,13 +344,15 @@ def triton_split_qkv_rmsnorm_mrope(
     k_bias: torch.Tensor | None = None,
     has_gate: bool = False,
     positions: torch.Tensor | None = None,
+    weight_offset: float = 0.0,
+    gate_output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split, normalize and rotate QKV, optionally gathering positions inline.
 
-    With ``positions=None``, preserve the original ABI: cos_sin contains
-    gathered rows and Q/K weights already include the unit offset. With
-    positions, cos_sin is the full rotary table and Q/K weights are the raw
-    zero-centered parameters; unit offsets are added in their dtype in-kernel.
+    ``positions`` optionally selects rows from the full rotary table in-kernel.
+    ``weight_offset`` moves the Gemma unit offset into the same launch. For
+    compatibility, callers that pass positions with the default offset still
+    receive the historical implicit +1 behavior.
     """
     core_num = get_vectorcore_num()
 
@@ -352,7 +365,7 @@ def triton_split_qkv_rmsnorm_mrope(
     if rope_dim is None:
         rope_dim = head_size
     if positions is not None:
-        _validate_rope_positions(positions, cos_sin, qkv, rope_dim)
+        validate_qsa_rope_positions(positions, cos_sin, qkv, rope_dim)
         if not qkv.is_contiguous() or qkv.shape[1] != q_size + gate_size + 2 * kv_size:
             raise ValueError("QSA QKV projection must be packed and contiguous")
         if any(
@@ -380,7 +393,13 @@ def triton_split_qkv_rmsnorm_mrope(
     q_output = torch.empty(num_tokens, q_size, device=qkv.device, dtype=qkv.dtype)
     k_output = torch.empty(num_tokens, kv_size, device=qkv.device, dtype=qkv.dtype)
     v_output = torch.empty(num_tokens, kv_size, device=qkv.device, dtype=qkv.dtype)
-    gate_output = torch.empty(num_tokens, gate_size, device=qkv.device, dtype=qkv.dtype)
+    if gate_output is None:
+        gate_output = torch.empty(num_tokens, gate_size, device=qkv.device, dtype=qkv.dtype)
+    elif gate_output.shape != (num_tokens, gate_size) or not gate_output.is_contiguous():
+        raise ValueError("gate_output must be contiguous and have shape [num_tokens, gate_size]")
+
+    if not num_tokens:
+        return q_output, k_output, v_output, gate_output
 
     if not num_tokens:
         return q_output, k_output, v_output, gate_output
@@ -422,6 +441,7 @@ def triton_split_qkv_rmsnorm_mrope(
         rope_dim // 2,
         IS_PARTIAL_ROPE,
         gate_size,
+        weight_offset=weight_offset,
         positions_ptr=positions,
         position_stride_axis=positions.stride(0) if positions is not None and positions.ndim == 2 else 0,
         position_stride_token=positions.stride(-1) if positions is not None else 0,
@@ -431,6 +451,82 @@ def triton_split_qkv_rmsnorm_mrope(
     )
 
     return q_output, k_output, v_output, gate_output
+
+
+def triton_split_qkv_rmsnorm_mrope(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    eps: float,
+    mrope_section: list[int],
+    is_interleaved: bool,
+    rope_dim: int | None = None,
+    q_bias: torch.Tensor | None = None,
+    k_bias: torch.Tensor | None = None,
+    has_gate: bool = False,
+    weight_offset: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _triton_split_qkv_rmsnorm_mrope(
+        qkv=qkv,
+        q_weight=q_weight,
+        k_weight=k_weight,
+        cos_sin=cos_sin,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        eps=eps,
+        mrope_section=mrope_section,
+        is_interleaved=is_interleaved,
+        rope_dim=rope_dim,
+        q_bias=q_bias,
+        k_bias=k_bias,
+        has_gate=has_gate,
+        positions=positions,
+        weight_offset=weight_offset,
+    )
+
+
+def triton_split_qkv_rmsnorm_mrope_with_gate_out(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    gate_output: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    eps: float,
+    mrope_section: list[int],
+    is_interleaved: bool,
+    rope_dim: int | None = None,
+    q_bias: torch.Tensor | None = None,
+    k_bias: torch.Tensor | None = None,
+    weight_offset: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_output, k_output, v_output, _ = _triton_split_qkv_rmsnorm_mrope(
+        qkv=qkv,
+        q_weight=q_weight,
+        k_weight=k_weight,
+        cos_sin=cos_sin,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        eps=eps,
+        mrope_section=mrope_section,
+        is_interleaved=is_interleaved,
+        rope_dim=rope_dim,
+        q_bias=q_bias,
+        k_bias=k_bias,
+        has_gate=True,
+        positions=positions,
+        weight_offset=weight_offset,
+        gate_output=gate_output,
+    )
+    return q_output, k_output, v_output
 
 
 def triton_split_qkv_rmsnorm_mrope_fake(
@@ -449,6 +545,7 @@ def triton_split_qkv_rmsnorm_mrope_fake(
     k_bias: torch.Tensor | None = None,
     has_gate: bool = False,
     positions: torch.Tensor | None = None,
+    weight_offset: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens = qkv.shape[0]
     q_size = num_q_heads * head_size
@@ -486,10 +583,42 @@ def triton_split_qkv_rmsnorm_mrope_fake(
     return q_output, k_output, v_output, gate_output
 
 
+def triton_split_qkv_rmsnorm_mrope_with_gate_out_fake(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    gate_output: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    eps: float,
+    mrope_section: list[int],
+    is_interleaved: bool,
+    rope_dim: int | None = None,
+    q_bias: torch.Tensor | None = None,
+    k_bias: torch.Tensor | None = None,
+    weight_offset: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens = qkv.shape[0]
+    q_output = torch.empty(num_tokens, num_q_heads * head_size, device=qkv.device, dtype=qkv.dtype)
+    k_output = torch.empty(num_tokens, num_kv_heads * head_size, device=qkv.device, dtype=qkv.dtype)
+    v_output = torch.empty_like(k_output)
+    return q_output, k_output, v_output
+
+
 direct_register_custom_op(
     op_name="triton_split_qkv_rmsnorm_mrope",
     op_func=triton_split_qkv_rmsnorm_mrope,
     fake_impl=triton_split_qkv_rmsnorm_mrope_fake,
     mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
+    op_name="triton_split_qkv_rmsnorm_mrope_with_gate_out",
+    op_func=triton_split_qkv_rmsnorm_mrope_with_gate_out,
+    fake_impl=triton_split_qkv_rmsnorm_mrope_with_gate_out_fake,
+    mutates_args=["gate_output"],
     dispatch_key="PrivateUse1",
 )

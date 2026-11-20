@@ -324,18 +324,21 @@ def _get_parallel_config_for_attn_metadata(attn_groups: list[list[AttentionGroup
 def _prepare_qsa_step_metadata(
     attn_metadata: dict[str, Any],
     qsa_main_builders: list[tuple[list[str], Any]],
+    num_actual_reqs: int,
     num_actual_tokens: int,
 ) -> None:
     """Prepare cross-layer QSA metadata once while inputs are being built."""
-    from vllm_ascend.models.qwen4_exp.attention_dispatch import prepare_qsa_union_batches
-    from vllm_ascend.ops.triton.qwen4_exp.gbsa import prepare_qsa_visible_lengths
+    from vllm_ascend.ops.triton.qwen4_exp.gbsa import (
+        prepare_qsa_gbsa_shared,
+        prepare_qsa_lengths,
+    )
 
     prepared_metadata_ids: set[int] = set()
     for layer_names, builder in qsa_main_builders:
         if not layer_names:
             continue
         layer = builder.vllm_config.compilation_config.static_forward_context.get(layer_names[0])
-        if not hasattr(layer, "indexer"):
+        if layer is None or not hasattr(layer, "indexer"):
             continue
         main_metadata = attn_metadata.get(layer_names[0])
         compressed_metadata = attn_metadata.get(layer.indexer.compressed_key_cache.prefix)
@@ -343,53 +346,75 @@ def _prepare_qsa_step_metadata(
             continue
         if id(main_metadata) in prepared_metadata_ids:
             continue
-        request_plan = getattr(main_metadata, "qsa_request_plan", None)
-        if request_plan is None:
+        if getattr(main_metadata, "qsa_request_plan", None) is not None:
             continue
+
+        requests = min(
+            num_actual_reqs,
+            int(getattr(compressed_metadata, "qsa_num_live_requests", num_actual_reqs)),
+        )
         rows = min(
             num_actual_tokens,
             int(getattr(compressed_metadata, "qsa_num_live_tokens", num_actual_tokens)),
         )
         device = compressed_metadata.seq_lens.device
+        max_requests = builder.vllm_config.scheduler_config.max_num_seqs
         max_tokens = builder.vllm_config.scheduler_config.max_num_batched_tokens
-        signature = (device, max_tokens)
-        buffer_cache = getattr(builder, "_qsa_visible_length_buffers", None)
+        index_heads = int(layer.indexer.index_n_heads)
+        table_columns = int(main_metadata.block_table.shape[1])
+        signature = (device, max_requests, max_tokens, index_heads, table_columns, main_metadata.block_table.dtype)
+        buffer_cache = getattr(builder, "_qsa_prepared_buffers", None)
         if buffer_cache is None:
             buffer_cache = {}
-            builder._qsa_visible_length_buffers = buffer_cache
-        visible_lengths = buffer_cache.get(signature)
-        if visible_lengths is None:
-            visible_lengths = torch.empty(max_tokens, dtype=torch.int32, device=device)
-            buffer_cache[signature] = visible_lengths
+            builder._qsa_prepared_buffers = buffer_cache
+        buffers = buffer_cache.get(signature)
+        if buffers is None:
+            score_weight = math.ldexp(
+                round(math.ldexp(1.0 / math.sqrt(int(layer.indexer.index_head_dim)), 11)),
+                -11,
+            )
+            buffers = {
+                "compressed_lengths": torch.empty(max_requests, dtype=torch.int32, device=device),
+                "residual_lengths": torch.empty(max_requests, dtype=torch.int32, device=device),
+                "score_weights": torch.full(
+                    (max_tokens, index_heads),
+                    score_weight,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "visible_lengths": torch.empty(max_tokens, dtype=torch.int32, device=device),
+                "cu_query": torch.arange(max_tokens + 1, dtype=torch.int64, device=device),
+                "row_block_table": torch.empty(
+                    (max_tokens, table_columns),
+                    dtype=main_metadata.block_table.dtype,
+                    device=device,
+                ),
+            }
+            buffer_cache[signature] = buffers
 
-        prepare_qsa_visible_lengths(
+        prepare_qsa_lengths(
+            compressed_metadata.seq_lens,
+            buffers["compressed_lengths"],
+            buffers["residual_lengths"],
+            requests,
+            int(layer.indexer.compress_ratio),
+        )
+        prepare_qsa_gbsa_shared(
             compressed_metadata.logical_positions,
             compressed_metadata.seq_lens,
             compressed_metadata.token_to_req,
-            visible_lengths,
+            main_metadata.block_table,
+            buffers["visible_lengths"],
+            buffers["row_block_table"],
             rows,
         )
-        main_metadata.qsa_request_plan = prepare_qsa_union_batches(
-            request_plan,
-            visible_lengths,
-            compressed_metadata.seq_lens,
-            main_metadata.block_table,
-        )
+        compressed_metadata.qsa_compressed_lengths = buffers["compressed_lengths"]
+        compressed_metadata.qsa_residual_lengths = buffers["residual_lengths"]
+        compressed_metadata.qsa_score_weights = buffers["score_weights"]
+        main_metadata.qsa_gbsa_visible_lengths = buffers["visible_lengths"]
+        main_metadata.qsa_gbsa_cu_query = buffers["cu_query"]
+        main_metadata.qsa_gbsa_row_block_table = buffers["row_block_table"]
         prepared_metadata_ids.add(id(main_metadata))
-def initialize_kernel_block_table_buffers(attn_groups: Iterable[AttentionGroup], max_num_reqs: int) -> None:
-    """Reserve Ascend request rows before warmup or graph capture.
-
-    Upstream sizes Group mappings for scheduler requests. PCP can expose two
-    local rows per request, and FIA can append a padding request. Reallocate
-    once during initialization so mapping never resizes graph-owned storage.
-    """
-    for group in attn_groups:
-        table = group.kernel_block_table
-        if table is None or table.shape[1] >= max_num_reqs:
-            continue
-        expanded = table.new_zeros((table.shape[0], max_num_reqs, table.shape[2]))
-        expanded[:, : table.shape[1]].copy_(table)
-        group.kernel_block_table = expanded
 
 
 def build_attn_metadata(
@@ -673,6 +698,7 @@ def build_attn_metadata(
         _prepare_qsa_step_metadata(
             attn_metadata,
             qsa_main_builders,
+            num_actual_reqs,
             num_actual_tokens,
         )
     return attn_metadata
