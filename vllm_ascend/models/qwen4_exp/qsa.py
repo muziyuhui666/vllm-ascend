@@ -1001,18 +1001,10 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        if not current_platform.opaque_attention_op():
-            return self._forward_impl(positions, hidden_states)
-        num_tokens = hidden_states.shape[0]
-        attn_output = hidden_states.new_empty(num_tokens, self.num_heads, self.head_dim)
-        torch.ops.vllm.qwen4_exp_ascend_qsa_core_with_output(
-            hidden_states,
-            positions,
-            attn_output,
-            upstream_qsa._encode_layer_name(self.layer_name),
-        )
-        output, _ = self.o_proj(attn_output.view(num_tokens, -1))
-        return output
+        # Reuse upstream's registered opaque QSA transaction. The Ascend
+        # subclass still supplies its platform backend and overridden
+        # preparation/cache methods, while avoiding an unregistered wrapper.
+        return super().forward(positions, hidden_states)
 
     def _forward_impl(
         self,
