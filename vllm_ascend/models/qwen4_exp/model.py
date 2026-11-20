@@ -31,6 +31,7 @@ from vllm_ascend.ops.triton.qwen4_exp.hc import (
 )
 
 from . import ple_embedding  # noqa: F401 - register the OOT host embedding before model construction
+from .hc_fused import AscendTextGatedResidual, prepare_model_textgr_weights
 from .ple import AscendPCPPLELayer, patch_upstream_ple_short_conv
 
 # Keep the upstream model and weight loader authoritative. HyperConnection's
@@ -41,6 +42,7 @@ upstream_hc.hc_combine = hc_combine
 upstream_hc.hc_combine_norm = hc_combine_norm
 upstream_hc.hc_gate_mix = hc_gate_mix
 upstream_hc.hc_silu = hc_silu
+upstream_hc.GatedResidual = AscendTextGatedResidual
 
 # Scope the graph-safe internal-format override to the upstream PLE custom op.
 patch_upstream_ple_short_conv()
@@ -58,6 +60,7 @@ upstream_model.sp_shard = sp_shard
 upstream_ple.sp_all_gather = sp_all_gather
 upstream_ple.sp_shard = sp_shard
 upstream_model.Qwen4ExpQSAAttention = AscendQwen4ExpQSAAttention
+upstream_model.GatedResidual = AscendTextGatedResidual
 
 
 class AscendQwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
@@ -159,6 +162,12 @@ class AscendQwen4ExpForCausalLM(upstream_model.Qwen4ExpForCausalLM):
 
     pp_intermediate_tensors_are_full_tokens = True
 
+    def process_weights_after_loading(self) -> None:
+        parent_hook = getattr(super(), "process_weights_after_loading", None)
+        if parent_hook is not None:
+            parent_hook()
+        prepare_model_textgr_weights(self)
+
     @classmethod
     def get_gdn_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
         upstream_shape = super().get_gdn_mamba_state_shape_from_config
@@ -196,6 +205,12 @@ class AscendQwen4ExpForConditionalGeneration(_AscendVLPreprocessMixin, upstream_
     """Qwen3.8-Flash-Next multimodal model using Ascend operators."""
 
     pp_intermediate_tensors_are_full_tokens = True
+
+    def process_weights_after_loading(self) -> None:
+        parent_hook = getattr(super(), "process_weights_after_loading", None)
+        if parent_hook is not None:
+            parent_hook()
+        prepare_model_textgr_weights(self)
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
