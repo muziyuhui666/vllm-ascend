@@ -947,7 +947,7 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
             metadata = metadata[0]
         if not isinstance(metadata, dict):
             return 0
-        return cast(QSAForwardMetadata, metadata[self.layer_name]).num_actual_tokens
+        return cast(QSAIndexerMetadataProtocol, metadata[self.layer_name]).num_actual_tokens
 
     def _start_indexer_projection(
         self,
@@ -1053,7 +1053,7 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
                     encoded_layer_name,
                 )
             elif index_query is not None and index_token_k is not None:
-                qwen4_exp_ascend_qsa_prepare_with_output(
+                upstream_qsa.qwen4_exp_ascend_qsa_prepare_with_output(
                     hidden_states,
                     positions,
                     qkv,
@@ -1103,7 +1103,7 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
                 encoded_layer_name,
             )
         elif index_query is not None and index_token_k is not None:
-            qwen4_exp_ascend_qsa_with_output(
+            upstream_qsa.qwen4_exp_ascend_qsa_with_output(
                 hidden_states,
                 positions,
                 query,
