@@ -22,6 +22,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
+from vllm.platforms import current_platform
 
 # Upstream model and QSA import each other; initialize the model first when
 # this submodule is imported directly, independently of lazy package exports.
@@ -48,7 +49,7 @@ from vllm_ascend.ops.triton.qwen4_exp.qsa import (
 from vllm_ascend.ops.triton.qwen4_exp.qsa import (
     qsa_store_cache_rows as qsa_store_cache_rows_fused,
 )
-from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.utils import npu_stream_switch, vllm_version_is
 
 from .attention_dispatch import build_qsa_request_plan, dispatch_qsa_attention
 from .gbsa import GBSA_PAGE_SIZE, qsa_gbsa_attention
@@ -79,6 +80,16 @@ else:
 QSA_INDEXER_KERNEL_BLOCK_SIZE = 512
 
 QSAKVCache: TypeAlias = tuple[torch.Tensor, torch.Tensor]
+
+_QSA_INDEXER_STREAM: torch.npu.Stream | None = None
+
+
+def _qsa_indexer_stream() -> torch.npu.Stream:
+    """Reuse one worker-local stream for the QSA indexer projection."""
+    global _QSA_INDEXER_STREAM
+    if _QSA_INDEXER_STREAM is None:
+        _QSA_INDEXER_STREAM = torch.npu.Stream()
+    return _QSA_INDEXER_STREAM
 
 
 def _store_qsa_cache_rows(
