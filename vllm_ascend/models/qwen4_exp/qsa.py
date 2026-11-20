@@ -16,7 +16,7 @@
 
 from copy import copy
 from dataclasses import replace
-from typing import Any, TypeAlias, cast
+from typing import Any, Protocol, TypeAlias, cast
 
 import torch
 from vllm.config import VllmConfig
