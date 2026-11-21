@@ -5,10 +5,33 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.worker import cp_utils
 
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.models.qwen4_exp import qsa
 from vllm_ascend.utils import vllm_version_is
+
+
+def test_replicated_qsa_draft_passes_pcp_compatibility(monkeypatch) -> None:
+    if vllm_version_is("0.33.0"):
+        impl = qsa.AscendQSAImpl(
+            2, 256, 0.0625, 1, None, None, "auto", None, AttentionType.DECODER
+        )
+    else:
+        impl = qsa.AscendQSAImpl(2, 256, 0.0625, 1, "auto")
+    layers = {"mtp.layers.0.self_attn": SimpleNamespace(impl=impl)}
+    monkeypatch.setattr(cp_utils, "get_layers_from_vllm_config", lambda *_: layers)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=object(),
+    )
+
+    cp_utils.check_attention_cp_compatibility(config, target_layer_names=set())
 
 
 @pytest.mark.parametrize("layout", ["contiguous", "row_stride", "column_stride"])
