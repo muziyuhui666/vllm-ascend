@@ -10,6 +10,7 @@ import torch
 
 from vllm_ascend.models.kimi_k3 import kimi_k3
 from vllm_ascend.ops import head_parallel, kda_pcp
+from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.ops.kimi_kda import AscendKimiK3DeltaAttention, KimiKDAInputParallelLinear
 
 
@@ -50,6 +51,21 @@ def test_kda_state_shapes_delegate_to_upstream_without_mutating_config(pcp, mode
     assert effective.cache_config is config.cache_config
     assert config.parallel_config.tensor_parallel_size == 2
     assert (effective is config) == (pcp == 1)
+
+
+def test_head_parallel_merged_projection_initializes_zero_padding():
+    with (
+        patch.object(head_parallel, "vllm_version_is", return_value=True),
+        patch.object(head_parallel.HeadParallelColumnLinear, "__init__", return_value=None) as init,
+    ):
+        projection = head_parallel.HeadParallelMergedColumnLinear(8, [16, 32], bias=False)
+
+    assert projection.padding_size == 0
+    assert projection.output_sizes == [16, 32]
+    assert projection.shard_ids == (0, 1)
+    init.assert_called_once()
+    assert init.call_args.args[1:] == (8, 48)
+    assert init.call_args.kwargs == {"bias": False}
 
 
 @pytest.mark.parametrize(("tp", "pcp"), [(1, 2), (2, 2), (2, 4)])
