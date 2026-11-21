@@ -106,7 +106,8 @@ def kda_pcp_gather(hidden_states: torch.Tensor, pcp_size: int, layer_name: str) 
         return gathered
     metadata = metadata_dict[layer_name]
     output = gathered.index_select(0, metadata.pcp_restore_idx)
-    return output.masked_fill(~metadata.pcp_restore_mask[:, None], 0)
+    # index_select owns fresh storage, so masking here cannot change gathered.
+    return output.masked_fill_(~metadata.pcp_restore_mask[:, None], 0)
 
 
 def kda_pcp_gather_fake(hidden_states: torch.Tensor, pcp_size: int, layer_name: str) -> torch.Tensor:
@@ -120,7 +121,9 @@ def kda_pcp_scatter(output: torch.Tensor, pcp_size: int, layer_name: str) -> tor
         return output[:local_tokens].clone()
     metadata = metadata_dict[layer_name]
     local_output = output.index_select(0, metadata.pcp_local_idx)
-    return local_output.masked_fill(~metadata.pcp_local_mask[:, None], 0)
+    # Only the freshly selected rows are mutated, preserving the custom op's
+    # no-input-mutation contract.
+    return local_output.masked_fill_(~metadata.pcp_local_mask[:, None], 0)
 
 
 def kda_pcp_scatter_fake(output: torch.Tensor, pcp_size: int, layer_name: str) -> torch.Tensor:
