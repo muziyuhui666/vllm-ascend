@@ -41,6 +41,8 @@ def implementation(monkeypatch):
         _MEGAMOE_SCALE_VIEWS=WeakKeyDictionary(),
         CUDAGraphMode=SimpleNamespace(NONE="NONE"),
         get_current_vllm_config=lambda: config,
+        WeightFormat=SimpleNamespace(MXFP4="mxfp4"),
+        require_mx_weight_format=lambda _: None,
         get_ascend_config=lambda: SimpleNamespace(),
     )
     scheme = _class(MXFP4, "AscendW4A8MXFPDynamicFusedMoEMethod")
