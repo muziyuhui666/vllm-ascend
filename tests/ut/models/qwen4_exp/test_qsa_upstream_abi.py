@@ -475,6 +475,46 @@ def test_pcp_indexer_replaces_registered_cache_owners() -> None:
         assert cache.get_attn_backend().get_builder_cls() is qsa.AscendPCPQSAIndexerMetadataBuilder
 
 
+
+def test_pcp_qsa_constructor_hides_pcp_from_upstream_guard(monkeypatch) -> None:
+    observed: list[int] = []
+    configured: list[object] = []
+
+    def upstream_init(owner, *, vllm_config, **_kwargs) -> None:
+        observed.append(vllm_config.parallel_config.prefill_context_parallel_size)
+        owner.indexer = SimpleNamespace(
+            configure_pcp_cache_backends=lambda config: configured.append(config)
+        )
+        owner.topk_indices_buffer = torch.zeros(2, 2, dtype=torch.int32)
+
+    monkeypatch.setattr(qsa.upstream_qsa.Qwen4ExpQSAAttention, "__init__", upstream_init)
+    parallel = SimpleNamespace(prefill_context_parallel_size=2)
+    config = SimpleNamespace(parallel_config=parallel)
+
+    layer = qsa.AscendQwen4ExpQSAAttention(vllm_config=config)
+
+    assert observed == [1]
+    assert configured == [config]
+    assert config.parallel_config is parallel
+    assert config.parallel_config.prefill_context_parallel_size == 2
+    torch.testing.assert_close(
+        layer.topk_indices_buffer,
+        torch.full_like(layer.topk_indices_buffer, -1),
+    )
+
+
+def test_non_pcp_qsa_constructor_uses_original_config(monkeypatch) -> None:
+    observed: list[object] = []
+
+    def upstream_init(owner, *, vllm_config, **_kwargs) -> None:
+        observed.append(vllm_config)
+        owner.topk_indices_buffer = torch.zeros(1, 1, dtype=torch.int32)
+
+    monkeypatch.setattr(qsa.upstream_qsa.Qwen4ExpQSAAttention, "__init__", upstream_init)
+    config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=1))
+    qsa.AscendQwen4ExpQSAAttention(vllm_config=config)
+    assert observed == [config]
+
 def test_pcp_indexer_global_write_invalidates_the_local_layout(monkeypatch) -> None:
     local_starts = torch.tensor([0, 2], dtype=torch.int32)
     global_starts = torch.tensor([0, 5], dtype=torch.int32)

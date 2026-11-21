@@ -935,8 +935,19 @@ class AscendPCPQSACompressedKeyCache(qsa_indexer.QSACompressedKeyCache):
 class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
     """Qwen4Exp QSA owner bound to the Ascend implementation."""
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, *, vllm_config: VllmConfig, **kwargs: object) -> None:
+        if vllm_config.parallel_config.prefill_context_parallel_size == 1:
+            super().__init__(vllm_config=vllm_config, **kwargs)
+        else:
+            # Upstream constructs token-local projections and cache owners,
+            # but rejects PCP before the Ascend implementation can replace
+            # those cache backends. Build the local objects with PCP hidden,
+            # then bind the PCP-aware metadata/cache owners to the real config.
+            local_config = copy(vllm_config)
+            local_config.parallel_config = copy(vllm_config.parallel_config)
+            local_config.parallel_config.prefill_context_parallel_size = 1
+            super().__init__(vllm_config=local_config, **kwargs)
+            self.indexer.configure_pcp_cache_backends(vllm_config)
         # The selector overwrites its compact prefix; the remaining ABI columns
         # stay at the sentinel value for the lifetime of this persistent buffer.
         self.topk_indices_buffer.fill_(-1)
