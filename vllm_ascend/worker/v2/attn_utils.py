@@ -344,6 +344,7 @@ def _prepare_qsa_step_metadata(
     num_actual_tokens: int,
 ) -> None:
     """Prepare cross-layer QSA metadata once while inputs are being built."""
+    from vllm_ascend.models.qwen4_exp.attention_dispatch import prepare_qsa_union_batches
     from vllm_ascend.ops.triton.qwen4_exp.gbsa import (
         prepare_qsa_gbsa_shared,
         prepare_qsa_lengths,
@@ -362,9 +363,6 @@ def _prepare_qsa_step_metadata(
             continue
         if id(main_metadata) in prepared_metadata_ids:
             continue
-        if getattr(main_metadata, "qsa_request_plan", None) is not None:
-            continue
-
         requests = min(
             num_actual_reqs,
             int(getattr(compressed_metadata, "qsa_num_live_requests", num_actual_reqs)),
@@ -415,21 +413,39 @@ def _prepare_qsa_step_metadata(
             requests,
             int(layer.indexer.compress_ratio),
         )
-        prepare_qsa_gbsa_shared(
-            compressed_metadata.logical_positions,
-            compressed_metadata.seq_lens,
-            compressed_metadata.token_to_req,
-            main_metadata.block_table,
-            buffers["visible_lengths"],
-            buffers["row_block_table"],
-            rows,
-        )
         compressed_metadata.qsa_compressed_lengths = buffers["compressed_lengths"]
         compressed_metadata.qsa_residual_lengths = buffers["residual_lengths"]
         compressed_metadata.qsa_score_weights = buffers["score_weights"]
-        main_metadata.qsa_gbsa_visible_lengths = buffers["visible_lengths"]
-        main_metadata.qsa_gbsa_cu_query = buffers["cu_query"]
-        main_metadata.qsa_gbsa_row_block_table = buffers["row_block_table"]
+        request_plan = getattr(main_metadata, "qsa_request_plan", None)
+        if request_plan is None:
+            prepare_qsa_gbsa_shared(
+                compressed_metadata.logical_positions,
+                compressed_metadata.seq_lens,
+                compressed_metadata.token_to_req,
+                main_metadata.block_table,
+                buffers["visible_lengths"],
+                buffers["row_block_table"],
+                rows,
+            )
+            main_metadata.qsa_gbsa_visible_lengths = buffers["visible_lengths"]
+            main_metadata.qsa_gbsa_cu_query = buffers["cu_query"]
+            main_metadata.qsa_gbsa_row_block_table = buffers["row_block_table"]
+        else:
+            prepare_qsa_gbsa_shared(
+                compressed_metadata.logical_positions,
+                compressed_metadata.seq_lens,
+                compressed_metadata.token_to_req,
+                main_metadata.block_table,
+                buffers["visible_lengths"],
+                buffers["row_block_table"],
+                rows,
+            )
+            main_metadata.qsa_request_plan = prepare_qsa_union_batches(
+                request_plan,
+                buffers["visible_lengths"],
+                compressed_metadata.seq_lens,
+                main_metadata.block_table,
+            )
         prepared_metadata_ids.add(id(main_metadata))
 
 
