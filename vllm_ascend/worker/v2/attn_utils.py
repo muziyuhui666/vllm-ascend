@@ -372,7 +372,14 @@ def _prepare_qsa_step_metadata(
             int(getattr(compressed_metadata, "qsa_num_live_tokens", num_actual_tokens)),
         )
         device = compressed_metadata.seq_lens.device
-        max_requests = builder.vllm_config.scheduler_config.max_num_seqs
+        # The metadata buffer can be wider than max_num_seqs when a large
+        # external request burst is compacted for Union-GBSA prefill. Size the
+        # reusable preparation buffers for the metadata capacity as well as
+        # the scheduler limit so high-concurrency pure-D runs cannot overflow.
+        max_requests = max(
+            builder.vllm_config.scheduler_config.max_num_seqs,
+            compressed_metadata.seq_lens.shape[0],
+        )
         max_tokens = builder.vllm_config.scheduler_config.max_num_batched_tokens
         index_heads = int(layer.indexer.index_n_heads)
         table_columns = int(main_metadata.block_table.shape[1])
