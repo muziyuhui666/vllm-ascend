@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_pcp_group, get_pp_group
+from vllm.triton_utils import tl, triton
 
 # vLLM main (#56888) replaced buffer_utils.async_copy_to_gpu with
 # torch_utils.async_tensor_h2d (gaining out=/device=None support).
@@ -44,6 +45,59 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffe
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
     from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+
+
+@triton.jit
+def _pcp_row_gather_kernel(
+    source_ptr,
+    row_indices_ptr,
+    output_ptr,
+    NUM_SOURCE_ROWS: tl.constexpr,
+    ROW_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    output_row = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # A5 faults on the scalar int64 conversion/address arithmetic generated
+    # for this tiny row index.  All PCP profile/runtime row ranges are far
+    # below INT32_MAX, so keep the address expression in int32.
+    row = tl.load(row_indices_ptr + output_row).to(tl.int32)
+    valid = (offsets < ROW_SIZE) & (row >= 0) & (row < NUM_SOURCE_ROWS)
+    value = tl.load(source_ptr + row * ROW_SIZE + offsets, mask=valid, other=0.0)
+    tl.store(output_ptr + output_row * ROW_SIZE + offsets, value, mask=offsets < ROW_SIZE)
+
+
+def _pcp_gather_rows(source: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
+    """Gather leading-dimension rows without torch-npu's native Index op.
+
+    The native Index kernel faults for the large padded PCP profile tensor on
+    Ascend 950 (for example, ``[2304, 2560] -> [64, 2560]``).  Flattening the
+    trailing dimensions keeps this helper valid for hidden states, positions,
+    and packed KV tensors alike.
+    """
+    if source.ndim == 0:
+        raise ValueError("PCP row gather requires a tensor with at least one dimension")
+    if row_indices.ndim != 1:
+        raise ValueError("PCP row indices must be one-dimensional")
+    if source.device.type != "npu":
+        return source.index_select(0, row_indices)
+    source = source.contiguous()
+    row_size = source.numel() // source.shape[0]
+    output = torch.empty(
+        (row_indices.numel(), *source.shape[1:]),
+        dtype=source.dtype,
+        device=source.device,
+    )
+    block_size = 256
+    _pcp_row_gather_kernel[(row_indices.numel(), triton.cdiv(row_size, block_size))](
+        source,
+        row_indices,
+        output,
+        NUM_SOURCE_ROWS=source.shape[0],
+        ROW_SIZE=row_size,
+        BLOCK_SIZE=block_size,
+    )
+    return output
 
 
 @dataclass(frozen=True)
@@ -71,12 +125,12 @@ class AscendPCPAttentionContext:
         if tokens.shape[0] != self.local_num_tokens:
             raise ValueError("PCP gather input must include the rank-local padding")
         gathered = get_pcp_group().all_gather(tokens.contiguous(), dim=0)
-        return gathered.index_select(0, self.hidden_restore_idx[: self.global_batch.num_tokens])
+        return _pcp_gather_rows(gathered, self.hidden_restore_idx[: self.global_batch.num_tokens])
 
     def scatter_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         """Return global results in padded rank-local model order."""
         assert self.local_token_indices is not None and self.local_num_tokens is not None
-        local = tokens.index_select(0, self.local_token_indices)
+        local = _pcp_gather_rows(tokens, self.local_token_indices)
         if local.shape[0] == self.local_num_tokens:
             return local
         padded = tokens.new_zeros((self.local_num_tokens, *tokens.shape[1:]))

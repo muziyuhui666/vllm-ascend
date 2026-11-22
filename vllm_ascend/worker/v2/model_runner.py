@@ -19,6 +19,8 @@
 
 import inspect
 import logging
+import os
+import traceback
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
@@ -27,6 +29,7 @@ from typing import Any, cast
 
 import numpy as np
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 from vllm.compilation import breakable_cudagraph
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
@@ -45,6 +48,7 @@ from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
+    InputBatch,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
     prepare_pos_seq_lens,
@@ -123,6 +127,53 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
     vllm_version_is,
 )
+
+
+class _ProfileIndexPutTraceMode(TorchDispatchMode):
+    """Temporary launch-site tracing for the PCP profile IndexPut failure."""
+
+    supports_higher_order_operators = True
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # Let TorchDynamo/Inductor handle Triton wrapper HOPs normally.  This
+        # temporary startup trace mode only instruments ordinary ATen index,
+        # gather and TopK operations.
+        if isinstance(func, torch._ops.HigherOrderOperator):
+            return NotImplemented
+        op_name = str(func).lower()
+        should_flush = (
+            "index" in op_name
+            or "gather" in op_name
+            or "top_k" in op_name
+            or "topk" in op_name
+        )
+        if should_flush:
+            tensor_args = []
+            for index, arg in enumerate(args):
+                if isinstance(arg, torch.Tensor):
+                    tensor_args.append(
+                        f"arg{index}=shape{tuple(arg.shape)}/{arg.dtype}/{arg.device}"
+                    )
+                elif isinstance(arg, (tuple, list)):
+                    for item_index, item in enumerate(arg):
+                        if isinstance(item, torch.Tensor):
+                            tensor_args.append(
+                                f"arg{index}[{item_index}]=shape{tuple(item.shape)}/"
+                                f"{item.dtype}/{item.device}"
+                            )
+            logger.warning(
+                "[PCP_INDEX_TRACE] op=%s %s\n%s",
+                func,
+                " ".join(tensor_args),
+                "".join(traceback.format_stack(limit=18)),
+            )
+        result = func(*args, **(kwargs or {}))
+        if should_flush:
+            # The A5 task queue can corrupt adjacent native Index/TopK launches
+            # during the large PCP memory-profile pass. Flush only these
+            # startup-only operations; normal serving remains asynchronous.
+            torch.npu.synchronize()
+        return result
 from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
 from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
@@ -135,7 +186,7 @@ from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
-from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager, _pcp_gather_rows
 from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.states import AscendRequestState
@@ -941,9 +992,16 @@ class NPUModelRunner(GPUModelRunner):
                     )
             self.max_num_tokens = profile_tokens
             try:
-                super().profile_run(**profile_kwargs)
+                if self.pcp_manager is not None:
+                    with _ProfileIndexPutTraceMode():
+                        super().profile_run(**profile_kwargs)
+                else:
+                    super().profile_run(**profile_kwargs)
             finally:
                 self.max_num_tokens = global_tokens
+                if os.environ.pop("VLLM_ASCEND_STARTUP_LAUNCH_BLOCKING", None):
+                    os.environ.pop("ASCEND_LAUNCH_BLOCKING", None)
+                    logger.info("Disabled startup-only ASCEND_LAUNCH_BLOCKING after profile run")
 
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
@@ -1445,6 +1503,37 @@ class NPUModelRunner(GPUModelRunner):
         # _dummy_run).
         self._finalize_dump_data(dump=False)
         return output
+
+    def _select_dummy_sample_hidden_states(
+        self, hidden_states: torch.Tensor, input_batch: InputBatch
+    ) -> torch.Tensor:
+        """Avoid native Index/GatherElements faults for PCP dummy tensors."""
+        if self.pcp_manager is not None:
+            return _pcp_gather_rows(hidden_states, input_batch.logits_indices)
+        return super()._select_dummy_sample_hidden_states(hidden_states, input_batch)
+
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
+        """Profile PCP sampler memory without the unstable fused TopK warmup.
+
+        The generic second pass deliberately enables every sampling feature.
+        On A5, its full-vocabulary BF16 TopK launch faults only in the PCP
+        startup profile, while the same operator and shape pass standalone.
+        The normal greedy pass plus an explicit FP32 logits allocation retains
+        the dominant memory peak; runtime kernel warmup remains unchanged.
+        """
+        if self.pcp_manager is None:
+            return super()._dummy_sampler_run(hidden_states)
+        assert self.sampler is not None
+        if self.model_state.dummy_sampler_run(self.sampler, hidden_states):
+            return
+        # The PCP profile pass only needs to account for the dominant logits
+        # buffers.  Running the generic dummy sampler here launches native
+        # Index/TopK with synthetic full-batch metadata and can fault under the
+        # A5 task queue; real request sampling is unaffected by skipping it.
+        logits = self.model.compute_logits(hidden_states)
+        fp32_logits = logits.float()
+        torch.npu.synchronize()
+        del fp32_logits
 
     def initialize_spec_cpu_length_sync(self) -> None:
         """Initialize model-specific and draft length policies after attention setup."""

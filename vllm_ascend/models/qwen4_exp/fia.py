@@ -161,6 +161,22 @@ def qsa_fia_attention(
             atten_mask[..., 0] &= has_selection.view_as(atten_mask[..., 0])
         query_length = (end - start) // batch_size
         atten_mask = atten_mask.reshape(batch_size, 1, query_length, mask_kv_length)
+        print(
+            "[PCP_FIA_TRACE] "
+            f"query={tuple(query[start:end].shape)} key={tuple(key.shape)} value={tuple(value.shape)} "
+            f"mask={tuple(atten_mask.shape)} compact={tuple(compact_indices[start:end].shape)} "
+            f"visible_shape={tuple(visible.shape)} visible_minmax="
+            f"{(int(visible.min().item()), int(visible.max().item()))} "
+            f"kv_length={kv_length} kv_lengths={kv_lengths} batch={batch_size} "
+            f"qlen={query_length} kv_heads={num_kv_heads} heads={num_heads} dim={head_dim} "
+            f"block_table={None if block_table is None else tuple(block_table.shape)} "
+            f"block_range={None if block_table is None else (int(block_table.min().item()), int(block_table.max().item()))} "
+            f"block_values={None if block_table is None else block_table.flatten().tolist()} "
+            f"key_stride={key.stride()} value_stride={value.stride()} "
+            f"query_stride={query[start:end].stride()} mask_stride={atten_mask.stride()} "
+            f"has_selection={int(has_selection.sum().item())}/{has_selection.numel()}",
+            flush=True,
+        )
         result, _ = torch_npu.npu_fused_infer_attention_score_v2(
             query=query[start:end].reshape(batch_size, query_length, num_heads * head_dim).contiguous(),
             key=key,

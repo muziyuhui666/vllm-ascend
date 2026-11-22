@@ -771,6 +771,7 @@ class AscendQSAMetadataBuilder(upstream_qsa.Qwen4ExpQSAMetadataBuilder):
                 lengths,
                 common_attn_metadata.num_actual_tokens,
                 phases,
+                force_union_prefill=pcp_context is not None,
             )
         return metadata
 
@@ -922,14 +923,26 @@ class AscendPCPQSAIndexerBackend(QSAIndexerBackend):  # type: ignore[valid-type,
         return AscendPCPQSAIndexerMetadataBuilder
 
 
+class AscendPCPQSACompressedKeyBackend(AscendQSACompressedKeyBackend):
+    """PCP metadata with Ascend's compressed-key kernel page contract."""
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
+    @staticmethod
+    def get_builder_cls() -> type[AscendPCPQSAIndexerMetadataBuilder]:
+        return AscendPCPQSAIndexerMetadataBuilder
+
+
 class AscendPCPQSARawKeyCache(QSARawKeyCache):  # type: ignore[valid-type, misc]
     def get_attn_backend(self) -> type[AscendPCPQSAIndexerBackend]:
         return AscendPCPQSAIndexerBackend
 
 
 class AscendPCPQSACompressedKeyCache(qsa_indexer.QSACompressedKeyCache):
-    def get_attn_backend(self) -> type[AscendPCPQSAIndexerBackend]:
-        return AscendPCPQSAIndexerBackend
+    def get_attn_backend(self) -> type[AscendPCPQSACompressedKeyBackend]:
+        return AscendPCPQSACompressedKeyBackend
 
 
 class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):

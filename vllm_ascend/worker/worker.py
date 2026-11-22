@@ -52,6 +52,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandsha
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
+from vllm.utils.network_utils import get_ip
 from vllm.model_executor.model_loader.weight_checksum import compute_tensor_digests, zero_weights
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -722,6 +723,53 @@ class NPUWorker(GPUWorker):
 
         return device
 
+    def _eager_init_pcp_communicator_for_host_offload(self) -> None:
+        """Initialize PCP HCCL before Engram registers large host tables.
+
+        HCCL lazily creates a communicator on the first collective.  With
+        Engram CPU offload, model loading can register tens of GiB of host
+        memory before that first collective.  Some drivers cannot create the
+        HDC context after those registrations and report the failure as a
+        misleading ``call network api fail``.  A one-element collective here
+        establishes the communicator while the worker address space is still
+        small.
+        """
+        engram_config = self.vllm_config.engram_config
+        if (
+            self.parallel_config.prefill_context_parallel_size <= 1
+            or engram_config is None
+            or not engram_config.cpu_offload
+        ):
+            return
+
+        token = torch.empty(1, dtype=torch.uint8, device=self.device)
+        get_pcp_group().all_gather(token, dim=0)
+        logger.info_once(
+            "Initialized the PCP communicator before Engram host offload.",
+            scope="local",
+        )
+
+    def _eager_init_mooncake_for_pcp(self) -> None:
+        """Create Mooncake's AICPU transfer pool before PCP HCCL/Engram use.
+
+        On A5, RunAicpuThreadInit can fail if the transfer engine is created
+        only after the PCP communicator, model weights, and Engram host tables
+        have all been initialized. The process-global engine is reused later
+        when the KV connector receives its cache layout.
+        """
+        kv_config = self.vllm_config.kv_transfer_config
+        if (
+            self.parallel_config.prefill_context_parallel_size <= 1
+            or kv_config is None
+            or "mooncake" not in kv_config.kv_connector.lower()
+        ):
+            return
+        global_te.get_transfer_engine(get_ip(), device_name=None)
+        logger.info_once(
+            "Initialized the Mooncake transfer engine before PCP HCCL and Engram.",
+            scope="local",
+        )
+
     def init_device(self):
         # NOTE: KEEP device the member of `NPUWorker`, as it will be checked
         # in ray scenario. see https://github.com/vllm-project/vllm/pull/26845
@@ -732,6 +780,8 @@ class NPUWorker(GPUWorker):
         # TODO: Drop this separate call when supported vLLM FLA or Triton Ascend
         # versions fix import-time NPU init and general registration is restored.
         register_ascend_fla_customop()
+        self._eager_init_mooncake_for_pcp()
+        self._eager_init_pcp_communicator_for_host_offload()
         # Initialize workspace manager
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)

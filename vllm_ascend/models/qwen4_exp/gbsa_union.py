@@ -121,8 +121,40 @@ def _run_union_gbsa(
     if kv_heads < 1 or q_heads < 1 or q_heads % kv_heads or q_heads // kv_heads > 16:
         raise ValueError("Union GBSA requires 1 to 16 Q heads per KV head and evenly sized head groups")
     if kv_heads > 1:
-        # The QSA indexer selects the same blocks for all KV heads.
-        union_inputs = tuple(t.expand(kv_heads, *t.shape[1:]).contiguous() for t in union_inputs)
+        # The deployed Arch35 Union kernel accepts one KV head per launch.
+        # QSA selects the same sparse blocks for every KV head, so split GQA
+        # into independent head groups and concatenate the outputs. This is
+        # mathematically equivalent to a native multi-KV-head launch.
+        q_heads_per_kv = q_heads // kv_heads
+        head_outputs = []
+        for head in range(kv_heads):
+            q_start = head * q_heads_per_kv
+            q_end = (head + 1) * q_heads_per_kv
+            head_query = query[:, q_start:q_end].contiguous()
+            head_output = torch.empty_like(head_query)
+            head_outputs.append(
+                _run_union_gbsa(
+                    union_ops,
+                    head_query,
+                    key_cache[:, :, head : head + 1].contiguous(),
+                    value_cache[:, :, head : head + 1].contiguous(),
+                    union_inputs,
+                    cu_q,
+                    seq_lens,
+                    block_table,
+                    head_output,
+                    max_query_length=max_query_length,
+                )
+            )
+        output.copy_(torch.cat(head_outputs, dim=1))
+        # The deployed external Union package launches work outside the
+        # allocator-aware PyTorch stream contract. Keep its temporary
+        # per-head inputs alive until both launches and the final copy have
+        # completed; otherwise asynchronous startup/profile runs can recycle
+        # the contiguous KV-head buffers while the device still reads them.
+        # This synchronization is scoped to the multi-KV-head fallback only.
+        torch.npu.current_stream().synchronize()
+        return output
     union_idx, union_count, exact = union_inputs
     common = dict(
         cu_seqlens_q=cu_q,

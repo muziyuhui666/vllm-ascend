@@ -34,6 +34,11 @@ class QSARequest:
         """Keep a chunk crossing 24K on FIA; switch subsequent chunks."""
         if not self.is_prefill:
             return self.query_start
+        # On A5, FIA faults for chunked Prefill when query length differs
+        # from logical KV length, even with dense K/V. Keep the square first
+        # chunk on FIA and route subsequent chunks through Union-GBSA.
+        if self.use_paged_kv:
+            return self.query_start
         query_length = self.query_end - self.query_start
         # Scheduler seq_lens already includes the current query chunk.
         total_logical_kv_length = self.kv_length
@@ -97,6 +102,8 @@ def build_qsa_request_plan(
     seq_lens_cpu: torch.Tensor,
     num_actual_tokens: int,
     is_prefilling_cpu: torch.Tensor,
+    *,
+    force_union_prefill: bool = False,
 ) -> QSARequestPlan:
     """Classify mixed-batch rows once for reuse by every QSA layer."""
     if any(t.device.type != "cpu" for t in (query_start_loc_cpu, seq_lens_cpu, is_prefilling_cpu)):
@@ -115,11 +122,11 @@ def build_qsa_request_plan(
                 QSARequest(request_index, start, end, int(lengths[request_index]), bool(phases[request_index]))
             )
     requests_tuple = tuple(requests)
-    fia_requests = tuple(request for request in requests_tuple if request.use_fia)
+    fia_requests = () if force_union_prefill else tuple(request for request in requests_tuple if request.use_fia)
     union_requests: list[list[QSARequest]] = []
     decode_spans: list[tuple[int, int]] = []
     for request in requests_tuple:
-        start = request.gbsa_query_start
+        start = request.query_start if force_union_prefill and request.is_prefill else request.gbsa_query_start
         if start >= request.query_end:
             continue
         if request.is_prefill:
@@ -133,9 +140,14 @@ def build_qsa_request_plan(
             decode_spans.append((start, request.query_end))
     union_batches = tuple(
         QSAUnionBatch(
-            batch[0].gbsa_query_start,
+            batch[0].query_start if force_union_prefill else batch[0].gbsa_query_start,
             batch[-1].query_end,
-            (0,) + tuple(request.query_end - batch[0].gbsa_query_start for request in batch),
+            (0,)
+            + tuple(
+                request.query_end
+                - (batch[0].query_start if force_union_prefill else batch[0].gbsa_query_start)
+                for request in batch
+            ),
             tuple(request.request_index for request in batch),
         )
         for batch in union_requests
@@ -233,15 +245,25 @@ def dispatch_qsa_attention(
             logical_positions[rows].add(1).clamp_min(0),
             seq_lens[request.request_index].clamp_max(fia_kv_length),
         )
-        # Callers whose ABI does not carry the freshly projected K/V pass None;
-        # the rows were already stored, so gather them from the paged cache.
+        # A5 CANN currently faults when FIA receives a multi-token Prefill query
+        # together with descriptor-backed paged K/V. Preserve FIA semantics by
+        # gathering only the referenced pages into a dense K/V tensor. Decode
+        # never reaches this host-planned path and remains zero-copy/graph-safe.
         if request.use_paged_kv or key is None or value is None:
-            keys, values, table, _ = prepare_qsa_fia_paged_kv(
-                key_cache,
-                value_cache,
-                block_table[request.request_index : request.request_index + 1],
-                fia_kv_length,
+            page_size = key_cache.shape[1]
+            page_count = (fia_kv_length + page_size - 1) // page_size
+            page_ids = (
+                block_table[request.request_index, :page_count]
+                .clamp_min(0)
+                .to(torch.long)
             )
+            keys = key_cache.index_select(0, page_ids).reshape(
+                -1, key_cache.shape[2], key_cache.shape[3]
+            )[:fia_kv_length]
+            values = value_cache.index_select(0, page_ids).reshape(
+                -1, value_cache.shape[2], value_cache.shape[3]
+            )[:fia_kv_length]
+            table = None
         else:
             keys, values, table = key[rows], value[rows], None
         qsa_fia_attention(

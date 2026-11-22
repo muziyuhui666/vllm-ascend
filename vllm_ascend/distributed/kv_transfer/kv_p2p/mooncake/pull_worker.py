@@ -661,9 +661,18 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                             // remote_metadata.block_size_scales[remote_layer_index][0]
                         )
                         assert local_kernel_block_size == remote_kernel_block_size, (
-                            "MooncakeConnector does not support different local and remote kernel block size %s | %s.",
+                            "MooncakeConnector does not support different local and remote kernel block size "
+                            "%s | %s; local_layer=%s remote_layer=%s local_spec=%s "
+                            "local_layer_block=%s local_scale=%s remote_layer_block=%s remote_scale=%s.",
                             local_kernel_block_size,
                             remote_kernel_block_size,
+                            self.layer_names[local_layer_index],
+                            remote_metadata.layer_names[remote_layer_index],
+                            type(spec).__name__,
+                            self.layer_block_sizes[local_layer_index],
+                            self.block_size_scales[local_layer_index],
+                            remote_metadata.layer_block_sizes[remote_layer_index],
+                            remote_metadata.block_size_scales[remote_layer_index],
                         )
                     transfer_block_ids = self._compute_group_block_ids(
                         request_id,

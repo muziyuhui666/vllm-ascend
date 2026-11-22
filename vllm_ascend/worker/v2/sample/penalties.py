@@ -274,7 +274,11 @@ def bincount(
     num_word_blocks = triton.cdiv(num_words, WORDS_PER_BLOCK)
     init_device_properties_triton()
     vector_cores = get_vectorcore_num()
-    output_bin_counts[expanded_idx_mapping] = 0
+    # Avoid advanced-index assignment here. On Ascend this lowers to
+    # IndexPutV2, whose high-performance int32 kernel can fault for the large
+    # [max_num_reqs, vocab_size] buffer used by the profile run. index_fill_
+    # has the same row-reset semantics without selecting that kernel.
+    output_bin_counts.index_fill_(0, expanded_idx_mapping.long(), 0)
     # Rounded rows keep the final word's unused flag bytes zero and aligned.
     prompt_flag = torch.zeros(
         num_requests, num_words * BITS_PER_WORD.value, dtype=torch.int8, device=prompt_bin_mask.device
