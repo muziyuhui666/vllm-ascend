@@ -299,6 +299,35 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
             )
         )
 
+    def _fused_compression_eligible(
+        self,
+        token_k: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_cache: torch.Tensor,
+        compressed_cache: torch.Tensor,
+    ) -> bool:
+        """Return whether the fixed Qwen3.8 compressed-key ABI is usable."""
+        norm_weight = self.k_layernorm.weight
+        return bool(
+            self._fused_norm_rope_eligible(token_k, positions)
+            and self.compress_ratio == 4
+            and token_k.device.type == "npu"
+            and norm_weight.shape == (self.index_head_dim,)
+            and norm_weight.is_contiguous()
+            and norm_weight.device == token_k.device
+            and rotary_cache.ndim == 2
+            and rotary_cache.shape[0] > 0
+            and rotary_cache.shape[1] == 64
+            and rotary_cache.stride(1) == 1
+            and rotary_cache.dtype == token_k.dtype
+            and rotary_cache.device == token_k.device
+            and compressed_cache.ndim == 4
+            and compressed_cache.shape[2:] == (1, self.index_head_dim)
+            and all(compressed_cache.shape)
+            and compressed_cache.dtype == token_k.dtype
+            and compressed_cache.device == token_k.device
+        )
+
     def _fused_norm_rope(
         self,
         tensor: torch.Tensor,
@@ -542,8 +571,9 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
             position_rows = qsa_indexer.canonical_qsa_rope_positions(positions)[:num_tokens].to(
                 device=raw_key_cache.device
             )
-        if self._fused_norm_rope_eligible(token_k, positions):
-            rotary_cache = self.rotary_emb._match_cos_sin_cache_dtype(token_k)  # noqa: SLF001
+        rotary_cache = self.rotary_emb._match_cos_sin_cache_dtype(token_k)  # noqa: SLF001
+        compressed_cache = self.compressed_key_cache.kv_cache
+        if self._fused_compression_eligible(token_k, positions, rotary_cache, compressed_cache):
             qsa_compress_norm_mrope_store(
                 token_k[:num_tokens],
                 position_rows,
@@ -557,7 +587,7 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
                 rope_position_cache,
                 norm_weight=self.k_layernorm.weight,
                 rotary_cache=rotary_cache,
-                compressed_cache=self.compressed_key_cache.kv_cache,
+                compressed_cache=compressed_cache,
                 norm_eps=self.k_layernorm.variance_epsilon,
             )
         else:
@@ -573,12 +603,9 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
                 self.compress_ratio,
                 rope_position_cache,
             )
-            normalized = self.normalize_compressed_keys(
-                pooled,
-                first_positions,
-            )
+            normalized = self.normalize_compressed_keys(pooled, first_positions)
             _store_qsa_cache_rows(
-                self.compressed_key_cache.kv_cache,
+                compressed_cache,
                 compressed_metadata.slot_mapping,
                 normalized,
             )
