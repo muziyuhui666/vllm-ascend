@@ -142,8 +142,6 @@ def _compress_qsa_groups(
         compress_ratio,
         rope_cache,
     )
-    assert result is not None
-    return result
 
 
 class QSAIndexerMetadataProtocol(Protocol):
