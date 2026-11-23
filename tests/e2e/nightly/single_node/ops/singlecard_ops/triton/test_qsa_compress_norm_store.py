@@ -10,7 +10,10 @@ from vllm_ascend.ops.triton.linearnorm.qsa_rmsnorm_mrope import triton_qsa_rmsno
 from vllm_ascend.ops.triton.qwen4_exp.qsa import qsa_compress_groups_with_ratio, qsa_store_cache_rows
 
 pytestmark = [
-    pytest.mark.skipif(get_ascend_device_type() != AscendDeviceType.A3, reason="Requires Ascend A3"),
+    pytest.mark.skipif(
+        get_ascend_device_type() not in (AscendDeviceType.A3, AscendDeviceType.A5),
+        reason="Requires Ascend A3 or A5",
+    ),
     pytest.mark.skipif(not HAS_TRITON, reason="Triton is not available"),
 ]
 
