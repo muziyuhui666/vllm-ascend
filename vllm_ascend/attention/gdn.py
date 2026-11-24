@@ -1148,6 +1148,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_size = 64
                 if (
                     chunk_meta.chunk_indices_chunk32_host is not None
+                    # Chunk32 FLA is not PCP-sharding safe under asynchronous
+                    # execution yet. Keep the established Chunk64 path for PCP.
+                    and get_pcp_group().world_size == 1
                     and value_non_spec.dtype == torch.bfloat16
                     and query_non_spec.shape[-1] == value_non_spec.shape[-1] == 128
                     and initial_state.dtype in (torch.float32, torch.bfloat16)
