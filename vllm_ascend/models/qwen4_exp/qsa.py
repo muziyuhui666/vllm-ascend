@@ -106,35 +106,6 @@ def _store_qsa_cache_rows(
     qsa_store_cache_rows_fused(cache, flat_slots, rows)
 
 
-def _compress_qsa_groups(
-    raw_keys: torch.Tensor,
-    raw_positions: torch.Tensor,
-    compressor_state_cache: torch.Tensor,
-    compressor_state_block_table: torch.Tensor,
-    token_to_req: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    logical_positions: torch.Tensor,
-    compressed_slots: torch.Tensor,
-    compress_ratio: int,
-    rope_cache: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pool completed groups with the fused QSA compression kernel."""
-    result = qsa_compress_groups_with_ratio_fused(
-        raw_keys,
-        raw_positions,
-        compressor_state_cache,
-        compressor_state_block_table,
-        token_to_req,
-        query_start_loc,
-        logical_positions,
-        compressed_slots,
-        compress_ratio,
-        rope_cache,
-    )
-    assert result is not None
-    return result
-
-
 class QSAIndexerMetadataProtocol(Protocol):
     """Metadata fields consumed by the Ascend sparse QSA implementation."""
 
@@ -470,46 +441,23 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
             position_rows = qsa_indexer.canonical_qsa_rope_positions(positions)[:num_tokens].to(
                 device=raw_key_cache.device
             )
-        if self._fused_norm_rope_eligible(token_k, positions):
-            rotary_cache = self.rotary_emb._match_cos_sin_cache_dtype(token_k)  # noqa: SLF001
-            qsa_compress_groups_with_ratio_fused(
-                token_k[:num_tokens],
-                position_rows,
-                raw_key_cache,
-                raw_metadata.block_table,
-                raw_metadata.token_to_req,
-                raw_metadata.query_start_loc,
-                raw_metadata.logical_positions,
-                compressed_metadata.slot_mapping,
-                self.compress_ratio,
-                rope_position_cache,
-                norm_weight=self.k_layernorm.weight,
-                rotary_cache=rotary_cache,
-                compressed_cache=self.compressed_key_cache.kv_cache,
-                norm_eps=self.k_layernorm.variance_epsilon,
-            )
-        else:
-            pooled, first_positions = _compress_qsa_groups(
-                token_k[:num_tokens],
-                position_rows,
-                raw_key_cache,
-                raw_metadata.block_table,
-                raw_metadata.token_to_req,
-                raw_metadata.query_start_loc,
-                raw_metadata.logical_positions,
-                compressed_metadata.slot_mapping,
-                self.compress_ratio,
-                rope_position_cache,
-            )
-            normalized = self.normalize_compressed_keys(
-                pooled,
-                first_positions,
-            )
-            _store_qsa_cache_rows(
-                self.compressed_key_cache.kv_cache,
-                compressed_metadata.slot_mapping,
-                normalized,
-            )
+        rotary_cache = self.rotary_emb._match_cos_sin_cache_dtype(token_k)  # noqa: SLF001
+        qsa_compress_groups_with_ratio_fused(
+            token_k[:num_tokens],
+            position_rows,
+            raw_key_cache,
+            raw_metadata.block_table,
+            raw_metadata.token_to_req,
+            raw_metadata.query_start_loc,
+            raw_metadata.logical_positions,
+            compressed_metadata.slot_mapping,
+            self.compress_ratio,
+            rope_position_cache,
+            norm_weight=self.k_layernorm.weight,
+            rotary_cache=rotary_cache,
+            compressed_cache=self.compressed_key_cache.kv_cache,
+            norm_eps=self.k_layernorm.variance_epsilon,
+        )
         # Keep ring writes after the fused launch: other rows can still read
         # the previous ring contents while producing compressed groups.
         _store_qsa_cache_rows(raw_key_cache, raw_metadata.slot_mapping, token_k[:num_tokens])
