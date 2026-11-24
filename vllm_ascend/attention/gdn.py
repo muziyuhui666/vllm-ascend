@@ -1155,11 +1155,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     chunk_size = 32
                     # Chunk32 applies sigmoid internally. Select raw b for the same
                     # prefill rows as Q/K/V; spec and recurrent decode keep their gates.
-                    beta_non_spec = b.unsqueeze(0)
-                    if spec_sequence_masks is not None:
-                        beta_non_spec = beta_non_spec.index_select(1, non_spec_token_indx)
-                    if split_non_spec:
-                        beta_non_spec = beta_non_spec[:, num_decode_tokens:]
+                    # b_non_spec has already been filtered to non-spec tokens and,
+                    # for mixed prefill/decode batches, sliced past decode tokens.
+                    beta_non_spec = b_non_spec.unsqueeze(0)
                 (core_attn_out_non_spec, last_recurrent_state) = DeviceOperator.fla_gdn_prefill(
                     q=query_non_spec,
                     k=key_non_spec,
