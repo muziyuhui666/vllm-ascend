@@ -63,8 +63,8 @@ def qsa_select_paged_tokens_lightning(
     neither decode length nor speculative-token count is used as a phase
     heuristic.
 
-    The upstream 2051-column output ABI is preserved while the compact
-    515-column group selection occupies its prefix.
+    Accept both the upstream 2051-column ABI and Ascend's compact 515-column
+    buffer.  The latter avoids a strided prefix before Union GBSA.
     """
     _validate_request_boundaries(
         query,
@@ -92,9 +92,10 @@ def qsa_select_paged_tokens_lightning(
 
     rows = query.shape[0]
     output_width = token_topk + compress_ratio - 1
+    packed_width = token_topk // compress_ratio + compress_ratio - 1
     if out is None:
         out = torch.empty((rows, output_width), dtype=torch.int32, device=query.device)
-    elif out.shape != (rows, output_width):
+    elif out.shape not in ((rows, output_width), (rows, packed_width)):
         raise ValueError("QSA LightningIndexer output has an invalid shape")
     if not rows:
         return out
@@ -102,7 +103,6 @@ def qsa_select_paged_tokens_lightning(
     # Keep unused ABI columns deterministic; MTP copies complete rows.
     out.fill_(-1)
     block_topk = token_topk // compress_ratio
-    packed_width = block_topk + compress_ratio - 1
     score_weight = 1.0 / math.sqrt(query.shape[2])
     row_requests = token_to_req.to(torch.int64)
     row_sequence_lengths = sequence_lengths[row_requests]
@@ -220,10 +220,10 @@ def qsa_select_paged_tokens_lightning_v2(
     Without counts, all input rows and requests are assumed live. Live requests
     and rows must occupy contiguous prefixes of the corresponding inputs.
 
-    Preserve the original [query_rows,2051] INT32 output ABI, including the
-    caller's buffer identity. The first 515 columns hold 512 logical group IDs
-    and up to three original-token tail IDs; all other/padded entries are -1.
-    Later MTP steps must continue to reuse the buffer without invoking selection.
+    Accept either the original [query_rows,2051] INT32 ABI or Ascend's compact
+    [query_rows,515] storage, preserving the caller's buffer identity. The live
+    columns hold 512 logical group IDs and up to three original-token tail IDs;
+    all padded entries are -1. MTP reuses the same rows without re-selection.
     """
     # CANN checks even singleton-axis strides strictly. Cache views may have
     # an arbitrary stride on the size-one head axis; normalize metadata only,
@@ -249,8 +249,11 @@ def qsa_select_paged_tokens_lightning_v2(
     if any(t.dtype not in (torch.int32, torch.int64) for t in (token_to_req, query_positions)):
         raise ValueError("QSA row mappings and positions must be integer tensors")
     output_width = token_topk + compress_ratio - 1
+    packed_width = token_topk // compress_ratio + compress_ratio - 1
     if out is not None and (
-        out.shape != (rows, output_width) or out.dtype != torch.int32 or out.device != query.device
+        out.shape not in ((rows, output_width), (rows, packed_width))
+        or out.dtype != torch.int32
+        or out.device != query.device
     ):
         raise ValueError("QSA LI V2 output must match query rows, INT32 dtype and device")
     if out is None:
@@ -314,7 +317,6 @@ def qsa_select_paged_tokens_lightning_v2(
         return_value=0,
         **common,
     )
-    packed_width = block_topk + compress_ratio - 1
     pack_qsa_group_indices_npu(
         groups.squeeze(1),
         query_positions[:live_rows],

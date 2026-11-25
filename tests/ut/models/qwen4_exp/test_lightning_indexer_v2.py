@@ -31,7 +31,7 @@ def selector(monkeypatch):
     ):
         monkeypatch.setattr(torch.ops.cann_ops_transformer, name, op, raising=False)
 
-    def fake_pack(groups, positions, lengths, mapping, ratio, topk, out):
+    def fake_pack(groups, positions, lengths, mapping, ratio, topk, out, **kwargs):
         # Check buffer wiring; real packing arithmetic is covered on NPU.
         out.fill_(-1)
         out[positions >= 0] = 7
@@ -47,6 +47,8 @@ def selector(monkeypatch):
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "lightning_indexer_v2_metadata", bindings.lightning_indexer_v2_metadata)
+    monkeypatch.setattr(module, "lightning_indexer_v2", bindings.lightning_indexer_v2)
     return module, bindings, packing, utilities
 
 
@@ -149,6 +151,32 @@ def test_empty_query_clears_output_without_launch(selector):
     bindings.lightning_indexer_v2.assert_not_called()
     bindings.lightning_indexer_v2_metadata.assert_not_called()
     packing.pack_qsa_group_indices_npu.assert_not_called()
+
+
+def test_compact_output_buffer_is_written_without_strided_prefix(selector):
+    module, _, packing, _ = selector
+    inputs = _inputs()
+    compact = torch.full((6, 515), 99, dtype=torch.int32)
+    metadata = inputs.pop("attn_metadata")
+    inputs.pop("out")
+
+    result = module.qsa_select_paged_tokens_lightning_v2(
+        **inputs,
+        block_table=metadata.block_table,
+        token_to_req=metadata.token_to_req,
+        query_positions=metadata.logical_positions,
+        sequence_lengths=metadata.seq_lens,
+        query_start_loc=metadata.query_start_loc,
+        out=compact,
+    )
+
+    assert result is compact
+    assert result.is_contiguous()
+    assert torch.all(result[:4] == 7)
+    assert torch.all(result[4:] == -1)
+    packed_out = packing.pack_qsa_group_indices_npu.call_args.args[6]
+    assert packed_out.data_ptr() == compact.data_ptr()
+    assert packed_out.is_contiguous()
 
 
 def test_further_trimmed_query_regenerates_prepared_schedule(selector):

@@ -228,6 +228,19 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
     raw_key_cache: Any
     compressed_key_cache: Any
 
+    @property
+    def output_width(self) -> int:
+        """Return the compact LI-v2 row width consumed by Ascend GBSA.
+
+        Upstream reserves ``token_topk + ratio - 1`` columns for token-level
+        indices.  Ascend's LightningIndexerV2 converts those selections to
+        compressed-group indices before returning, so only
+        ``token_topk / ratio + ratio - 1`` columns are live.  Keeping the
+        larger upstream row makes the live compact prefix strided and forces
+        Union GBSA to materialize it with an InplaceCopy/Slice kernel.
+        """
+        return self.token_topk // self.compress_ratio + self.compress_ratio - 1
+
     def configure_pcp_cache_backends(self, vllm_config: VllmConfig) -> None:
         # Only the cache owners need new backends. Keep upstream's indexer
         # projection, cache dtype and ring configuration.
@@ -818,7 +831,11 @@ class AscendQSAImpl(AttentionImplBase[Any]):
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
         packed_width = layer.indexer.token_topk // layer.indexer.compress_ratio + layer.indexer.compress_ratio - 1
-        compact_indices = selected_indices[:, :packed_width]
+        compact_indices = (
+            selected_indices
+            if selected_indices.shape[1] == packed_width
+            else selected_indices[:, :packed_width]
+        )
         request_plan = getattr(attn_metadata, "qsa_request_plan", None)
         if request_plan is None:
             logger.info_once("QSA attention is using the CANN GBSA backend.")
