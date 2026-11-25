@@ -463,9 +463,7 @@ def test_fla_prefill_supports_host_metadata(monkeypatch):
     assert AscendGatedDeltaNetAttention._supports_host_metadata_prefill()
 
 
-@pytest.mark.parametrize("supports_chunk32", [False, True])
-def test_host_metadata_skips_unused_chunk_helpers(monkeypatch, supports_chunk32):
-    monkeypatch.setattr(ascend_gdn_attn_builder, "_supports_fla_chunk32", lambda: supports_chunk32)
+def test_host_metadata_skips_unused_chunk_helpers(monkeypatch):
     builder = _make_builder(
         device=torch.device("cpu"),
         num_heads=32,
@@ -485,10 +483,8 @@ def test_host_metadata_skips_unused_chunk_helpers(monkeypatch, supports_chunk32)
         )
     original_prepare_indices = ascend_gdn_attn_builder.prepare_chunk_indices
 
-    calls = []
-
     def prepare_indices_once(cu, chunk_size):
-        calls.append(chunk_size)
+        assert chunk_size == ascend_gdn_attn_builder._GDN_CHUNK_SIZE
         return original_prepare_indices(cu, chunk_size)
 
     monkeypatch.setattr(ascend_gdn_attn_builder, "prepare_chunk_indices", prepare_indices_once)
@@ -507,12 +503,6 @@ def test_host_metadata_skips_unused_chunk_helpers(monkeypatch, supports_chunk32)
     assert chunk_meta.block_indices_cumsum is None
     expected = original_prepare_indices(cu_seqlens, ascend_gdn_attn_builder._GDN_CHUNK_SIZE)
     assert chunk_meta.chunk_indices_chunk64_host == tuple(expected.to(torch.int64).flatten().tolist())
-    assert calls == ([64, 32] if supports_chunk32 else [64])
-    if supports_chunk32:
-        expected32 = original_prepare_indices(cu_seqlens, 32)
-        assert chunk_meta.chunk_indices_chunk32_host == tuple(expected32.flatten().tolist())
-    else:
-        assert chunk_meta.chunk_indices_chunk32_host is None
 
 
 @pytest.mark.parametrize("has_pcp_context", [False, True])

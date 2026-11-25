@@ -1144,23 +1144,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     prefill_state_indices,
                     prefill_has_initial_state,
                 )
-                chunk_meta = attn_metadata.non_spec_prefill_metadata.chunk
-                chunk_size = 64
-                if (
-                    chunk_meta.chunk_indices_chunk32_host is not None
-                    # Chunk32 FLA is not PCP-sharding safe under asynchronous
-                    # execution yet. Keep the established Chunk64 path for PCP.
-                    and get_pcp_group().world_size == 1
-                    and value_non_spec.dtype == torch.bfloat16
-                    and query_non_spec.shape[-1] == value_non_spec.shape[-1] == 128
-                    and initial_state.dtype in (torch.float32, torch.bfloat16)
-                ):
-                    chunk_size = 32
-                    # Chunk32 applies sigmoid internally. Select raw b for the same
-                    # prefill rows as Q/K/V; spec and recurrent decode keep their gates.
-                    # b_non_spec has already been filtered to non-spec tokens and,
-                    # for mixed prefill/decode batches, sliced past decode tokens.
-                    beta_non_spec = b_non_spec.unsqueeze(0)
                 (core_attn_out_non_spec, last_recurrent_state) = DeviceOperator.fla_gdn_prefill(
                     q=query_non_spec,
                     k=key_non_spec,
@@ -1169,9 +1152,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     beta=beta_non_spec,
                     initial_state=initial_state,
                     scale=key_non_spec.shape[-1] ** -0.5,
-                    prebuilt_meta=chunk_meta,
+                    prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
                     fused_fwd=fla_gdn_prefill_op,
-                    chunk_size=chunk_size,
                 )
                 scatter_ssm_states_(
                     ssm_state,
