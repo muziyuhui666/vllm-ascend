@@ -107,11 +107,19 @@ class AscendQwen4ExpModel(upstream_model.Qwen4ExpModel):
             if text_config.linear_num_key_heads % head_shards or text_config.linear_num_value_heads % head_shards:
                 raise ValueError("Qwen4Exp GDN key and value heads must be divisible by TP * PCP")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        model_layers = self.layers[self.start_layer : self.end_layer]
+        # Qwen4Exp has one GDN module in every decoder layer. Ask the host
+        # metadata builder to materialize the first block-table column once
+        # per step instead of slicing and copying it again in every layer's
+        # CausalConv1d call.
+        for layer in model_layers:
+            if hasattr(layer, "linear_attn"):
+                layer.linear_attn.use_contiguous_conv_indices = True
         if use_pcp:
             from vllm_ascend.attention.gdn import shard_gdn_heads_over_pcp
 
             static_context = vllm_config.compilation_config.static_forward_context
-            for layer in self.layers[self.start_layer : self.end_layer]:
+            for layer in model_layers:
                 if hasattr(layer, "linear_attn"):
                     shard_gdn_heads_over_pcp(layer.linear_attn, parallel)
                 if layer.ple is not None and not isinstance(layer.ple, AscendPCPPLELayer):
