@@ -805,9 +805,14 @@ class AscendQSAImpl(AttentionImplBase[Any]):
     ) -> torch.Tensor:
         """Run GBSA, or the FIA/GBSA split planned for this step."""
         num_tokens = attn_metadata.num_actual_tokens
-        output.zero_()
         if num_tokens == 0:
+            output.zero_()
             return output
+        # Every live row is overwritten by the selected attention backend.
+        # Only clear graph-padding rows; clearing the whole persistent output
+        # buffer adds a large InplaceZero kernel to full-token prefill steps.
+        if num_tokens < output.shape[0]:
+            output[num_tokens:].zero_()
         selected_indices = layer.topk_indices_buffer[:num_tokens]
         key_cache, value_cache = kv_cache
         key_cache = canonicalize_singleton_dim_strides(key_cache)

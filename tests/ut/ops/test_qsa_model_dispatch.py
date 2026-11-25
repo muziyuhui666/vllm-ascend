@@ -31,6 +31,58 @@ def _load_dispatch(class_name, methods, base, **dependencies):
     return namespace[class_name]()
 
 
+@pytest.mark.parametrize("num_tokens", [0, 2, 4])
+def test_qsa_dispatch_only_clears_graph_padding(num_tokens):
+    seen = []
+
+    def gbsa(*args, **kwargs):
+        output = args[8]
+        seen.append(output.clone())
+        output.fill_(7)
+        return output
+
+    layer_impl = _load_dispatch(
+        "AscendQSAImpl",
+        {"_dispatch_qsa"},
+        object,
+        canonicalize_singleton_dim_strides=lambda tensor: tensor,
+        qsa_gbsa_attention=gbsa,
+        dispatch_qsa_attention=Mock(),
+        logger=SimpleNamespace(info_once=Mock()),
+    )
+    output = torch.full((4, 1, 2), 3.0)
+    layer = SimpleNamespace(
+        topk_indices_buffer=torch.zeros(4, 8, dtype=torch.int32),
+        indexer=SimpleNamespace(token_topk=4, compress_ratio=1),
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=num_tokens,
+        qsa_request_plan=None,
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+    )
+    result = layer_impl._dispatch_qsa(
+        layer,
+        torch.zeros(4, 1, 2),
+        None,
+        None,
+        (torch.zeros(1), torch.zeros(1)),
+        metadata,
+        output,
+        torch.zeros(4, dtype=torch.int32),
+        torch.arange(4),
+        torch.tensor([num_tokens], dtype=torch.int32),
+    )
+
+    if num_tokens == 0:
+        assert seen == []
+        assert torch.count_nonzero(result) == 0
+    else:
+        # Live rows must not be cleared before the backend overwrites them.
+        torch.testing.assert_close(seen[0], torch.full_like(seen[0], 3.0))
+        torch.testing.assert_close(result[:num_tokens], torch.full_like(result[:num_tokens], 7.0))
+        torch.testing.assert_close(result[num_tokens:], torch.zeros_like(result[num_tokens:]))
+
+
 def _rotary():
     return SimpleNamespace(
         mrope_section=[11, 11, 10],
