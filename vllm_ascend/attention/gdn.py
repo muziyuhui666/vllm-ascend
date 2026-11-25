@@ -458,8 +458,28 @@ def _split_head_first_conv_output(
     Keep the common attention interface [1, T, H, D] for mixed batches,
     the A5 BSND kernel, and fallback backends. These are views, not copies.
     """
-    q, k, v = output.split((num_k_heads, num_k_heads, num_v_heads), dim=0)
-    return tuple(part.transpose(0, 1).unsqueeze(0) for part in (q, k, v))
+    total_heads = 2 * num_k_heads + num_v_heads
+    if output.ndim != 3 or output.shape[0] != total_heads:
+        raise ValueError(f"Expected convolution output [{total_heads}, T, D], got {tuple(output.shape)}")
+
+    # torch.split lowers to three Slice kernels on NPU even though these
+    # tensors only need to alias contiguous head ranges. Build the views from
+    # the original storage metadata so no device work is enqueued.
+    stride = output.stride()
+    base_offset = output.storage_offset()
+
+    def head_view(start: int, count: int) -> torch.Tensor:
+        part = output.as_strided(
+            (count, output.shape[1], output.shape[2]),
+            stride,
+            base_offset + start * stride[0],
+        )
+        return part.transpose(0, 1).unsqueeze(0)
+
+    q = head_view(0, num_k_heads)
+    k = head_view(num_k_heads, num_k_heads)
+    v = head_view(2 * num_k_heads, num_v_heads)
+    return q, k, v
 
 
 def _rearrange_decode_qkv(
