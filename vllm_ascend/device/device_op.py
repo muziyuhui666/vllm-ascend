@@ -1071,8 +1071,22 @@ class BaseDeviceAdaptor:
         return output, final_state.transpose(-1, -2).contiguous()
 
     @staticmethod
-    def fused_gdn_gating(A_log: torch.Tensor, a: torch.Tensor, b: torch.Tensor, dt_bias: torch.Tensor):
-        return fused_gdn_gating_patch(A_log, a, b, dt_bias)
+    def fused_gdn_gating(
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        dt_bias: torch.Tensor,
+        output_head_major: bool = False,
+        output_raw_beta: bool = False,
+    ):
+        return fused_gdn_gating_patch(
+            A_log,
+            a,
+            b,
+            dt_bias,
+            output_head_major=output_head_major,
+            output_raw_beta=output_raw_beta,
+        )
 
     @staticmethod
     def split_qkv_rmsnorm_rope(
@@ -2163,8 +2177,22 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return output, final_state
 
     @staticmethod
-    def fused_gdn_gating(A_log: torch.Tensor, a: torch.Tensor, b: torch.Tensor, dt_bias: torch.Tensor):
-        return fused_gdn_gating_patch(A_log, a, b, dt_bias)
+    def fused_gdn_gating(
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        dt_bias: torch.Tensor,
+        output_head_major: bool = False,
+        output_raw_beta: bool = False,
+    ):
+        return fused_gdn_gating_patch(
+            A_log,
+            a,
+            b,
+            dt_bias,
+            output_head_major=output_head_major,
+            output_raw_beta=output_raw_beta,
+        )
 
     @staticmethod
     def split_qkv_rmsnorm_rope(
